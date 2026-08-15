@@ -2,11 +2,11 @@ import os
 import json
 import random
 import asyncio
-import requests
 import math
-import shutil
+import time
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from groq import Groq
 import edge_tts
@@ -14,10 +14,12 @@ import edge_tts
 from moviepy import (
     VideoFileClip,
     AudioFileClip,
+    ImageClip,
     CompositeAudioClip,
+    CompositeVideoClip,
     concatenate_videoclips,
+    concatenate_audioclips,
 )
-
 import moviepy.video.fx as vfx
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -26,6 +28,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 
 
 # ============================================================
@@ -38,75 +41,52 @@ GROQ_KEY = os.getenv("GROQ_API_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 
 if not GROQ_KEY:
-    raise ValueError(
-        "GROQ_API_KEY missing. Add GROQ_API_KEY=... to your .env file."
-    )
+    raise ValueError("GROQ_API_KEY missing.")
 
 if not PEXELS_API_KEY:
-    raise ValueError(
-        "PEXELS_API_KEY missing. Add PEXELS_API_KEY=... to your .env file."
-    )
+    raise ValueError("PEXELS_API_KEY missing.")
 
 groq_client = Groq(api_key=GROQ_KEY)
-
-# ------------------------------------------------------------
-# Folders
-# ------------------------------------------------------------
 
 OUTPUT_DIR = Path("output")
 CLIPS_DIR = OUTPUT_DIR / "clips"
 AUDIO_DIR = OUTPUT_DIR / "audio"
 CAPTION_DIR = OUTPUT_DIR / "captions"
 THUMBNAIL_DIR = OUTPUT_DIR / "thumbnails"
-
 SFX_DIR = Path("sfx")
 
-for directory in [
+for folder in (
     OUTPUT_DIR,
     CLIPS_DIR,
     AUDIO_DIR,
     CAPTION_DIR,
     THUMBNAIL_DIR,
     SFX_DIR,
-]:
-    directory.mkdir(parents=True, exist_ok=True)
+):
+    folder.mkdir(parents=True, exist_ok=True)
 
-
-# ------------------------------------------------------------
-# Files
-# ------------------------------------------------------------
-
-BGM_FILE = "bgm.mp3"
-
+BGM_FILE = Path("bgm.mp3")
 WHOOSH_FILE = SFX_DIR / "whoosh.mp3"
 IMPACT_FILE = SFX_DIR / "impact.mp3"
 HEARTBEAT_FILE = SFX_DIR / "heartbeat.mp3"
 HIT_FILE = SFX_DIR / "hit.mp3"
 
-TOKEN_FILE = "token.json"
-CLIENT_SECRET_FILE = "client_secret.json"
-
-
-# ------------------------------------------------------------
-# Video
-# ------------------------------------------------------------
+TOKEN_FILE = Path("token.json")
+CLIENT_SECRET_FILE = Path("client_secret.json")
 
 VIDEO_WIDTH = 1080
 VIDEO_HEIGHT = 1920
 FPS = 30
 
-TARGET_MIN_DURATION = 22
-TARGET_MAX_DURATION = 35
-
 VOICE = "hi-IN-MadhurNeural"
-
-# Faster than previous version.
 VOICE_RATE = "+16%"
 VOICE_PITCH = "-2Hz"
 
+YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+
 
 # ============================================================
-# MYSTERY TOPICS
+# INDIA-ONLY MYSTERY TOPICS
 # ============================================================
 
 MYSTERY_TOPICS = [
@@ -135,9 +115,9 @@ MYSTERY_TOPICS = [
     "Vijayanagara Empire mystery",
     "Shani Shingnapur Maharashtra mystery",
     "Shiv Temple India ancient architecture mystery",
-    "Kailasa Temple Ellora impossible construction mystery",
+    "Kailasa Temple Ellora construction mystery",
     "Iron Pillar Delhi rust mystery",
-    "Delhi Sultanate forgotten mystery",
+    "Delhi Sultanate forgotten history",
     "Red Fort Delhi hidden history",
     "Qutub Minar Delhi hidden history",
     "Agrasen ki Baoli Delhi mystery",
@@ -148,24 +128,136 @@ MYSTERY_TOPICS = [
     "Amer Fort Jaipur secret passage mystery",
     "Bhangarh village folklore mystery",
     "Indian freedom movement unsolved mystery",
-    "Subhas Chandra Bose disappearance mystery",
-    "Lal Bahadur Shastri death mystery",
-    "Netaji Subhas Chandra Bose historical mystery",
-    "Indian royal family historical mystery",
+    "Subhas Chandra Bose historical mystery",
+    "Lal Bahadur Shastri historical mystery",
     "Indian ancient manuscript mystery",
     "Indian archaeological discovery mystery",
     "Indian temple underground tunnel mystery",
     "Indian lost city historical mystery",
     "Indian shipwreck historical mystery",
-    "Indian haunted fort historical mystery",
+    "Indian haunted fort folklore mystery",
     "Indian cave civilization mystery",
     "Indian ancient engineering mystery",
     "Indian astronomy ancient history mystery",
     "Indian stepwell hidden history",
     "Indian railway historical mystery",
-    "Indian village disappearance folklore mystery",
     "Indian historical artifact mystery",
 ]
+
+
+# ============================================================
+# INDIA-ONLY VALIDATION
+# ============================================================
+
+FORBIDDEN_FOREIGN_TERMS = [
+    "bermuda",
+    "dyatlov",
+    "roanoke",
+    "mary celeste",
+    "tutankhamun",
+    "egypt",
+    "egyptian",
+    "nazca",
+    "antikythera",
+    "voynich",
+    "oak island",
+    "atlantis",
+    "stonehenge",
+    "jack the ripper",
+    "amelia earhart",
+    "d.b. cooper",
+    "pompeii",
+    "roman empire",
+    "viking",
+    "europe",
+    "america",
+    "new york",
+    "london",
+    "paris",
+    "japan",
+    "china",
+    "greece",
+    "mesopotamia",
+]
+
+INDIA_TERMS = [
+    "india",
+    "indian",
+    "भारत",
+    "भारतीय",
+    "rajasthan",
+    "delhi",
+    "uttarakhand",
+    "odisha",
+    "karnataka",
+    "kerala",
+    "tamil nadu",
+    "tamil",
+    "andhra",
+    "telangana",
+    "maharashtra",
+    "gujarat",
+    "bihar",
+    "madhya pradesh",
+    "west bengal",
+    "punjab",
+    "assam",
+    "goa",
+    "hampi",
+    "varanasi",
+    "jaipur",
+    "agra",
+    "hyderabad",
+    "mumbai",
+    "kolkata",
+    "chennai",
+    "puri",
+    "konark",
+]
+
+
+def ensure_india_query(query):
+    query = str(query or "").strip()
+    lowered = query.lower()
+
+    if any(term in lowered for term in FORBIDDEN_FOREIGN_TERMS):
+        raise ValueError(f"Non-Indian visual query rejected: {query}")
+
+    if not any(term in lowered for term in INDIA_TERMS):
+        query = f"India {query}"
+
+    return query
+
+
+def validate_indian_story(data):
+    combined = " ".join(
+        str(data.get(key, ""))
+        for key in ("topic", "title", "description", "hook")
+    ).lower()
+
+    if any(term in combined for term in FORBIDDEN_FOREIGN_TERMS):
+        raise ValueError(
+            "Generated story contains a non-Indian topic."
+        )
+
+    if not any(term in combined for term in INDIA_TERMS):
+        raise ValueError(
+            "Generated story does not clearly identify India."
+        )
+
+    scenes = data.get("scenes", [])
+
+    if len(scenes) != 7:
+        raise ValueError(
+            f"Expected exactly 7 scenes, got {len(scenes)}"
+        )
+
+    for scene in scenes:
+        scene["pexels_query"] = ensure_india_query(
+            scene.get("pexels_query", "")
+        )
+
+    return data
 
 
 # ============================================================
@@ -173,7 +265,6 @@ MYSTERY_TOPICS = [
 # ============================================================
 
 def generate_mystery_story():
-
     topic = random.choice(MYSTERY_TOPICS)
 
     print("\n" + "=" * 75)
@@ -183,158 +274,50 @@ def generate_mystery_story():
 
     prompt = f"""
 You are a professional Hindi YouTube Shorts writer for an INDIA-ONLY channel.
-Your niche is Indian dark history, Indian mysteries, Indian facts, Indian archaeology,
-and unusual stories from India's past.
-
-ABSOLUTE INDIA-ONLY RULE:
-- The story MUST be about INDIA.
-- The people, place, event, object, history, archaeology, folklore or mystery MUST be connected to India.
-- NEVER choose or mention Bermuda Triangle, Egypt, Rome, Vikings, Europe, America, Japan,
-  or any other non-Indian mystery as the main topic.
-- Do not use foreign examples just for comparison.
-- Pexels queries MUST be searchable Indian visuals. Add India, the Indian state/city,
-  or a specific Indian landmark whenever possible.
-- If the topic is folklore or a disputed claim, clearly label it as folklore/theory and do not present it as fact.
 
 TOPIC:
 {topic}
 
-Create ONE highly engaging Hindi YouTube Short.
+Create ONE factual, highly engaging Hindi YouTube Short about India.
 
-TARGET LENGTH:
-20-32 seconds. Keep the spoken delivery compact and fast.
+TARGET:
+20-32 seconds.
+Create exactly 7 visual scenes.
 
 FACTUAL RULE:
-Only present established information as fact.
-When evidence is uncertain use wording such as:
+Only established information may be presented as fact.
+For uncertain claims use:
 "एक सिद्धांत के अनुसार..."
 "कुछ इतिहासकार मानते हैं..."
 "लोककथाओं के अनुसार..."
 "आज तक इसका निश्चित जवाब नहीं मिला..."
 "इस दावे की स्वतंत्र पुष्टि नहीं हुई है..."
 
-DO NOT invent dates, people, discoveries, scientific claims, quotes or evidence.
-If the topic is a popular Indian legend, separate legend from documented history.
+Never invent dates, people, discoveries, scientific claims, quotes or evidence.
+Separate folklore from documented history.
 
-==========================================================
-VIRAL RETENTION STRUCTURE
-==========================================================
+RETENTION:
+0-2 sec = powerful hook.
+2-6 sec = mystery setup.
+6-18 sec = clue chain.
+18-27 sec = strongest revelation.
+Final seconds = unanswered question.
 
-0-2 SEC — EXTREME HOOK:
-The first spoken line MUST create a strong curiosity gap immediately.
-It should make the viewer think: "आगे क्या हुआ?"
-Use a concrete Indian place/person/object when possible.
-
-Good hook style:
-"राजस्थान की इस जगह पर लोग रात में जाना क्यों छोड़ देते हैं?"
-"भारत की इस झील में मिले कंकालों का राज आज तक पूरी तरह नहीं सुलझा।"
-"दिल्ली में एक ऐसी बावड़ी है, जिसके बारे में इतिहास आज भी सवाल छोड़ता है।"
-"इस भारतीय मंदिर को देखकर आज भी एक सवाल उठता है—इसे बनाया कैसे गया?"
-
-NEVER begin with:
+Do not begin with:
 "आज हम बात करेंगे..."
 "क्या आप जानते हैं..."
 "नमस्कार दोस्तों..."
-"दोस्तों आज की वीडियो में..."
 
-2-6 SEC — MYSTERY SETUP:
-Give the most surprising Indian fact quickly.
+Every pexels_query MUST target India or an Indian location.
+Never request foreign visuals.
 
-6-18 SEC — CLUE CHAIN:
-Reveal one new fact or clue every sentence.
-Use short spoken sentences. No filler.
+Captions must be maximum 4 words.
 
-18-27 SEC — STRONGEST REVELATION:
-Give the most interesting documented clue, contradiction or historical detail.
+Return ONLY valid JSON:
 
-FINAL 2-4 SEC — CURIOSITY PAYOFF:
-End with a powerful unanswered question that invites comments.
-Example style:
-"लेकिन अगर कहानी इतनी सी नहीं है... तो असली वजह क्या थी?"
-
-IMPORTANT:
-Do not give away every detail too early.
-Build a curiosity chain:
-HOOK → MYSTERY → CLUE → BIGGER CLUE → REVELATION → UNANSWERED QUESTION
-
-==========================================================
-LANGUAGE + VOICE
-==========================================================
-
-Natural spoken Hindi.
-Short sentences.
-Fast, energetic delivery.
-Use punctuation for dramatic micro-pauses.
-Avoid long sentences and filler words.
-The first sentence must sound strong even without context.
-
-==========================================================
-VISUAL STORYTELLING
-==========================================================
-
-Create exactly 7 visual beats.
-Each beat should be roughly 2-5 seconds.
-Change visuals frequently.
-Every visual must directly match the narration.
-
-IMPORTANT INDIA VISUAL RULE:
-Every pexels_query must target India or an Indian location/object.
-Use queries like:
-"Bhangarh Fort Rajasthan India night"
-"Kuldhara village Rajasthan India"
-"Roopkund lake Uttarakhand India"
-"Indian ancient temple India"
-"Rajasthan fort India aerial"
-"old Indian map close up"
-"Indian archaeological excavation"
-"Delhi old monument India"
-"Hampi Karnataka India ruins"
-"Kerala temple India"
-
-Do NOT use generic foreign visuals such as pyramids, Egyptian temples,
-European castles, Viking ships, New York, etc.
-If an exact historical scene is unavailable on Pexels, use a visually relevant
-Indian location, monument, map, manuscript, excavation or landscape.
-
-==========================================================
-ORIGINAL EDITING
-==========================================================
-
-The final video should feel intentionally edited, not like a raw stock compilation.
-Use:
-- rapid cuts
-- punch-in zooms
-- subtle movement
-- strong opening frame
-- short caption changes
-- contextual text cards
-- atmospheric overlays
-- SFX moments
-- low-volume suspense BGM
-- final question
-
-==========================================================
-CAPTIONS
-==========================================================
-
-Create short captions, maximum 4 words.
-Use curiosity-heavy Hindi such as:
-"राज़ अभी बाकी है"
-"लेकिन क्यों?"
-"सबसे बड़ा सवाल"
-"सच्चाई क्या थी?"
-"इतिहास चुप है"
-
-==========================================================
-OUTPUT
-==========================================================
-
-Return ONLY valid JSON.
-
-Format:
 {{
   "topic": "...",
-  "title": "...",
+  "title": "... #Shorts",
   "description": "...",
   "hook": "...",
   "scenes": [
@@ -350,23 +333,7 @@ Format:
   ]
 }}
 
-TITLE:
-Maximum approximately 55 characters.
-Make it curiosity-driven and clearly Indian.
-Examples:
-"इस किले का राज़ आज तक नहीं खुला 😱 #Shorts"
-"भारत की इस झील में मिले कंकाल क्यों? 😱 #Shorts"
-
-Use relevant hashtags such as:
-#Shorts #IndianMystery #IndianHistory #IndiaFacts
-
-DESCRIPTION:
-Natural Hindi description about the Indian story.
-Do not keyword stuff.
-Mention that disputed claims are presented as theories/folklore when applicable.
-End with a natural question for viewers.
-
-The final scene MUST contain a question that encourages comments.
+The final scene MUST ask a question that encourages comments.
 """
 
     response = groq_client.chat.completions.create(
@@ -376,24 +343,18 @@ The final scene MUST contain a question that encourages comments.
                 "role": "system",
                 "content": (
                     "You are a factual, high-retention Hindi "
-                    "dark-history YouTube Shorts writer."
+                    "Indian dark-history YouTube Shorts writer."
                 ),
             },
-            {
-                "role": "user",
-                "content": prompt,
-            },
+            {"role": "user", "content": prompt},
         ],
         temperature=0.82,
         response_format={"type": "json_object"},
     )
 
-    content = response.choices[0].message.content
-
-    data = json.loads(content)
-
-    if "scenes" not in data:
-        raise RuntimeError("Story JSON does not contain scenes.")
+    data = json.loads(
+        response.choices[0].message.content
+    )
 
     data = validate_indian_story(data)
 
@@ -407,79 +368,19 @@ The final scene MUST contain a question that encourages comments.
 
 
 # ============================================================
-# INDIA-ONLY VISUAL GUARD
-# ============================================================
-
-FORBIDDEN_FOREIGN_TERMS = [
-    "bermuda", "dyatlov", "roanoke", "mary celeste", "tutankhamun",
-    "egypt", "egyptian", "nazca", "antikythera", "voynich", "oak island",
-    "atlantis", "stonehenge", "jack the ripper", "amelia earhart", "d.b. cooper",
-    "pompeii", "roman empire", "viking", "europe", "america", "new york",
-    "london", "paris", "japan", "china", "greece", "mesopotamia"
-]
-
-
-def ensure_india_query(query):
-    """Keep stock-footage searches focused on India."""
-    query = str(query or "").strip()
-    lowered = query.lower()
-
-    if any(term in lowered for term in FORBIDDEN_FOREIGN_TERMS):
-        raise ValueError(f"Non-Indian visual query rejected: {query}")
-
-    india_terms = [
-        "india", "indian", "rajasthan", "delhi", "uttarakhand", "odisha",
-        "karnataka", "kerala", "tamil nadu", "andhra pradesh", "telangana",
-        "maharashtra", "gujarat", "bihar", "madhya pradesh", "west bengal",
-        "punjab", "assam", "goa", "hampi", "varanasi", "jaipur", "agra",
-        "hyderabad", "mumbai", "kolkata", "chennai", "puri", "konark"
-    ]
-
-    if not any(term in lowered for term in india_terms):
-        query = f"India {query}"
-
-    return query
-
-
-def validate_indian_story(data):
-    """Reject an AI response if it drifts away from the India-only niche."""
-    topic = str(data.get("topic", ""))
-    title = str(data.get("title", ""))
-    description = str(data.get("description", ""))
-    combined = f"{topic} {title} {description}".lower()
-
-    if any(term in combined for term in FORBIDDEN_FOREIGN_TERMS):
-        raise ValueError("Generated story contains a non-Indian topic. Regenerate it.")
-
-    if not any(term in combined for term in [
-        "india", "indian", "भारत", "भारतीय", "rajasthan", "delhi", "uttarakhand",
-        "odisha", "karnataka", "kerala", "tamil", "maharashtra", "gujarat",
-        "bihar", "madhya pradesh", "andhra", "telangana", "punjab", "assam"
-    ]):
-        raise ValueError("Generated story does not clearly identify India.")
-
-    scenes = data.get("scenes", [])
-    if len(scenes) != 7:
-        raise ValueError(f"Expected exactly 7 scenes, got {len(scenes)}")
-
-    for scene in scenes:
-        scene["pexels_query"] = ensure_india_query(scene.get("pexels_query", ""))
-
-    return data
-
-
-# ============================================================
 # PEXELS SEARCH
 # ============================================================
 
 def search_pexels_video(query):
+    query = ensure_india_query(query)
 
     print(f"\n🔎 PEXELS SEARCH: {query}")
 
     url = "https://api.pexels.com/videos/search"
 
     headers = {
-        "Authorization": PEXELS_API_KEY
+        "Authorization": PEXELS_API_KEY,
+        "User-Agent": "Mozilla/5.0",
     }
 
     params = {
@@ -489,234 +390,186 @@ def search_pexels_video(query):
         "size": "large",
     }
 
-    try:
-
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=30,
-        )
-
-        if response.status_code != 200:
-
-            print(
-                "❌ Pexels error:",
-                response.status_code,
-            )
-
-            return None
-
-        data = response.json()
-
-        videos = data.get("videos", [])
-
-        # ----------------------------------------------------
-        # Fallback to landscape
-        # ----------------------------------------------------
-
-        if not videos:
-
-            print(
-                "⚠️ No portrait footage. "
-                "Trying landscape..."
-            )
-
-            params["orientation"] = "landscape"
-
+    for attempt in range(1, 4):
+        try:
             response = requests.get(
                 url,
                 headers=headers,
                 params=params,
-                timeout=30,
+                timeout=(20, 45),
             )
 
             if response.status_code != 200:
+                print(
+                    f"❌ Pexels error {response.status_code}"
+                )
                 return None
 
             data = response.json()
-
             videos = data.get("videos", [])
 
-        if not videos:
-            return None
+            if not videos:
+                print(
+                    "⚠️ No portrait footage. Trying landscape..."
+                )
 
-        candidates = []
+                params["orientation"] = "landscape"
 
-        for video in videos:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=(20, 45),
+                )
 
-            files = video.get(
-                "video_files",
-                []
+                if response.status_code != 200:
+                    return None
+
+                videos = response.json().get(
+                    "videos",
+                    []
+                )
+
+            if not videos:
+                return None
+
+            candidates = []
+
+            for video in videos:
+                for file in video.get("video_files", []):
+                    width = file.get("width") or 0
+                    height = file.get("height") or 0
+                    link = file.get("link")
+
+                    if not link:
+                        continue
+
+                    if width >= 720 or height >= 720:
+                        candidates.append(
+                            {
+                                "url": link,
+                                "width": width,
+                                "height": height,
+                                "duration": video.get(
+                                    "duration",
+                                    0,
+                                ),
+                            }
+                        )
+
+            if not candidates:
+                return None
+
+            vertical = [
+                x for x in candidates
+                if x["height"] > x["width"]
+            ]
+
+            if vertical:
+                candidates = vertical
+
+            candidates.sort(
+                key=lambda x: (
+                    x["width"] * x["height"]
+                ),
+                reverse=True,
             )
 
-            for file in files:
+            selected = random.choice(
+                candidates[:min(8, len(candidates))]
+            )
 
-                width = file.get(
-                    "width"
-                ) or 0
+            print(
+                "✅ Selected:",
+                selected["width"],
+                "x",
+                selected["height"],
+            )
 
-                height = file.get(
-                    "height"
-                ) or 0
+            return selected
 
-                link = file.get("link")
+        except Exception as e:
+            print(
+                f"⚠️ Pexels attempt {attempt}/3 failed:",
+                e,
+            )
 
-                if not link:
-                    continue
+            if attempt < 3:
+                time.sleep(3 * attempt)
 
-                # Prefer useful resolution.
-                if width >= 720 or height >= 720:
-
-                    candidates.append(
-                        {
-                            "url": link,
-                            "width": width,
-                            "height": height,
-                            "duration": video.get(
-                                "duration",
-                                0
-                            ),
-                        }
-                    )
-
-        if not candidates:
-            return None
-
-        # Prefer vertical.
-        vertical = [
-            x
-            for x in candidates
-            if x["height"] > x["width"]
-        ]
-
-        if vertical:
-            candidates = vertical
-
-        # Prefer higher resolution.
-        candidates.sort(
-            key=lambda x: (
-                x["width"] * x["height"]
-            ),
-            reverse=True,
-        )
-
-        # Pick from top candidates to avoid always selecting
-        # the exact same clip.
-        top_candidates = candidates[
-            :min(8, len(candidates))
-        ]
-
-        selected = random.choice(
-            top_candidates
-        )
-
-        print(
-            "✅ Selected:",
-            selected["width"],
-            "x",
-            selected["height"],
-        )
-
-        return selected
-
-    except Exception as e:
-
-        print(
-            "❌ Pexels request failed:",
-            e,
-        )
-
-        return None
+    print("❌ Pexels search failed after retries.")
+    return None
 
 
 # ============================================================
-# DOWNLOAD
+# DOWNLOAD VIDEO WITH RETRIES
 # ============================================================
 
 def download_video(url, filename):
-
-    print(
-        f"⬇️ Downloading {filename}"
-    )
-
     path = CLIPS_DIR / filename
 
-    try:
+    print(f"⬇️ Downloading {filename}")
 
-        with requests.get(
-            url,
-            stream=True,
-            timeout=120,
-        ) as response:
+    for attempt in range(1, 4):
+        try:
+            print(
+                f"   Download attempt {attempt}/3"
+            )
 
-            if response.status_code != 200:
+            with requests.get(
+                url,
+                stream=True,
+                timeout=(20, 180),
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 "
+                        "(Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 "
+                        "Chrome/151 Safari/537.36"
+                    )
+                },
+            ) as response:
 
-                print(
-                    "❌ Download failed:",
-                    response.status_code,
-                )
+                response.raise_for_status()
 
-                return None
+                with open(path, "wb") as file:
+                    for chunk in response.iter_content(
+                        chunk_size=1024 * 1024
+                    ):
+                        if chunk:
+                            file.write(chunk)
 
-            with open(
-                path,
-                "wb",
-            ) as file:
+            if path.exists() and path.stat().st_size > 10000:
+                print("✅ Saved:", path)
+                return str(path)
 
-                for chunk in response.iter_content(
-                    chunk_size=1024 * 1024
-                ):
+        except Exception as e:
+            print(
+                f"⚠️ Download attempt {attempt} failed:",
+                e,
+            )
 
-                    if chunk:
-                        file.write(chunk)
+            if attempt < 3:
+                time.sleep(3 * attempt)
 
-        print(
-            "✅ Saved:",
-            path,
-        )
-
-        return str(path)
-
-    except Exception as e:
-
-        print(
-            "❌ Download error:",
-            e,
-        )
-
-        return None
-
-
-# ============================================================
-# SCENE VIDEO
-# ============================================================
-
-def get_scene_video(
-    scene_number,
-    query,
-):
-
-    result = search_pexels_video(
-        query
+    print(
+        f"❌ Could not download {filename}"
     )
+    return None
+
+
+def get_scene_video(scene_number, query):
+    result = search_pexels_video(query)
 
     if not result:
-
         print(
-            f"⚠️ Scene {scene_number}: "
-            "No suitable footage."
+            f"⚠️ Scene {scene_number}: No suitable footage."
         )
-
         return None
-
-    filename = (
-        f"scene_{scene_number}.mp4"
-    )
 
     return download_video(
         result["url"],
-        filename,
+        f"scene_{scene_number}.mp4",
     )
 
 
@@ -724,36 +577,24 @@ def get_scene_video(
 # VOICE
 # ============================================================
 
-async def create_voice(
-    text,
-    output_file,
-):
-
+async def create_voice(text, output_file):
     communicate = edge_tts.Communicate(
         text=text,
         voice=VOICE,
         rate=VOICE_RATE,
         pitch=VOICE_PITCH,
     )
-
-    await communicate.save(
-        output_file
-    )
+    await communicate.save(output_file)
 
 
-def generate_voice(
-    text,
-    scene_number,
-):
-
+def generate_voice(text, scene_number):
     filename = (
         AUDIO_DIR /
         f"voice_{scene_number}.mp3"
     )
 
     print(
-        f"🎙️ Generating fast male Hindi voice "
-        f"scene {scene_number}"
+        f"🎙️ Generating Hindi voice scene {scene_number}"
     )
 
     asyncio.run(
@@ -771,19 +612,17 @@ def generate_voice(
 # ============================================================
 
 def find_font():
-
     fonts = [
-
         "C:/Windows/Fonts/NirmalaB.ttf",
-
         "C:/Windows/Fonts/mangal.ttf",
-
         "C:/Windows/Fonts/arialbd.ttf",
-
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Bold.ttf",
+        "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     ]
 
     for font in fonts:
-
         if os.path.exists(font):
             return font
 
@@ -791,7 +630,7 @@ def find_font():
 
 
 # ============================================================
-# CAPTION IMAGE
+# CAPTIONS
 # ============================================================
 
 def create_caption_image(
@@ -799,111 +638,55 @@ def create_caption_image(
     filename,
     emphasis=False,
 ):
-
     image = Image.new(
         "RGBA",
-        (
-            VIDEO_WIDTH,
-            360,
-        ),
-        (
-            0,
-            0,
-            0,
-            0,
-        ),
+        (VIDEO_WIDTH, 360),
+        (0, 0, 0, 0),
     )
 
-    draw = ImageDraw.Draw(
-        image
-    )
-
+    draw = ImageDraw.Draw(image)
     font_path = find_font()
 
     if font_path:
-
-        font_size = (
-            78
-            if emphasis
-            else 68
-        )
-
         font = ImageFont.truetype(
             font_path,
-            font_size,
+            78 if emphasis else 68,
         )
-
     else:
-
         font = ImageFont.load_default()
 
-    # --------------------------------------------------------
-    # Word wrapping
-    # --------------------------------------------------------
-
     words = str(text).split()
-
     lines = []
-
     current = ""
 
     for word in words:
-
-        test = (
-            current + " " + word
-        ).strip()
+        test = f"{current} {word}".strip()
 
         if len(test) > 22:
-
             if current:
-                lines.append(
-                    current
-                )
-
+                lines.append(current)
             current = word
-
         else:
-
             current = test
 
     if current:
         lines.append(current)
 
     lines = lines[:2]
-
-    total_height = (
-        len(lines) * 90
-    )
-
-    y = (
-        180 -
-        total_height // 2
-    )
+    y = 180 - (len(lines) * 90) // 2
 
     for line in lines:
-
         bbox = draw.textbbox(
             (0, 0),
             line,
             font=font,
         )
 
-        text_width = (
-            bbox[2] -
-            bbox[0]
-        )
+        text_width = bbox[2] - bbox[0]
+        x = (VIDEO_WIDTH - text_width) // 2
 
-        x = (
-            VIDEO_WIDTH -
-            text_width
-        ) // 2
-
-        # Shadow
         draw.text(
-            (
-                x + 5,
-                y + 5,
-            ),
+            (x + 5, y + 5),
             line,
             font=font,
             fill="black",
@@ -911,12 +694,8 @@ def create_caption_image(
             stroke_fill="black",
         )
 
-        # Main text
         draw.text(
-            (
-                x,
-                y,
-            ),
+            (x, y),
             line,
             font=font,
             fill="white",
@@ -926,45 +705,24 @@ def create_caption_image(
 
         y += 90
 
-    image.save(
-        filename
-    )
-
+    image.save(filename)
     return filename
 
 
 # ============================================================
-# PREPARE SHORTS CLIP
+# VIDEO FORMAT
 # ============================================================
 
-def prepare_clip_for_shorts(
-    clip
-):
-
+def prepare_clip_for_shorts(clip):
     width = clip.w
     height = clip.h
 
-    target_ratio = (
-        VIDEO_WIDTH /
-        VIDEO_HEIGHT
-    )
-
-    current_ratio = (
-        width /
-        height
-    )
+    target_ratio = VIDEO_WIDTH / VIDEO_HEIGHT
+    current_ratio = width / height
 
     if current_ratio > target_ratio:
-
-        new_width = int(
-            height *
-            target_ratio
-        )
-
-        x1 = (
-            width -
-            new_width
-        ) // 2
+        new_width = int(height * target_ratio)
+        x1 = (width - new_width) // 2
 
         clip = clip.cropped(
             x1=x1,
@@ -972,130 +730,72 @@ def prepare_clip_for_shorts(
         )
 
     else:
-
-        new_height = int(
-            width /
-            target_ratio
-        )
-
-        y1 = (
-            height -
-            new_height
-        ) // 2
+        new_height = int(width / target_ratio)
+        y1 = (height - new_height) // 2
 
         clip = clip.cropped(
             y1=y1,
             y2=y1 + new_height,
         )
 
-    clip = clip.resized(
+    return clip.resized(
         width=VIDEO_WIDTH,
         height=VIDEO_HEIGHT,
     )
 
-    return clip
 
-
-# ============================================================
-# RAPID CUT CREATOR
-# ============================================================
-
-def create_rapid_segments(
-    video,
-    target_duration,
-):
-
-    """
-    Creates several short sections from one stock clip.
-
-    This prevents one stock clip from remaining visually
-    unchanged for a long time.
-    """
-
+def create_rapid_segments(video, target_duration):
     if video.duration <= 0:
         return []
 
     segments = []
 
-    # Usually 2-3 seconds per visual beat.
     segment_count = max(
         2,
-        int(
-            math.ceil(
-                target_duration /
-                2.5
-            )
-        ),
+        math.ceil(target_duration / 2.5),
     )
 
     segment_duration = (
-        target_duration /
-        segment_count
+        target_duration / segment_count
     )
 
-    for i in range(
-        segment_count
-    ):
-
+    for i in range(segment_count):
         if video.duration <= segment_duration:
-
-            source_start = 0
-
+            start = 0
         else:
-
             available = (
                 video.duration -
                 segment_duration
             )
 
-            source_start = (
+            start = (
                 available *
                 i /
-                max(
-                    1,
-                    segment_count - 1
-                )
+                max(1, segment_count - 1)
             )
 
-        source_end = (
-            source_start +
-            segment_duration
-        )
-
-        source_end = min(
-            source_end,
+        end = min(
+            start + segment_duration,
             video.duration,
         )
 
-        if source_end <= source_start:
+        if end <= start:
             continue
 
         piece = video.subclipped(
-            source_start,
-            source_end,
+            start,
+            end,
         )
 
-        # Alternate crop positioning.
         piece = prepare_clip_for_shorts(
             piece
         )
 
-        # ----------------------------------------------------
-        # Fast subtle zoom.
-        # ----------------------------------------------------
-
         try:
-
             if i % 3 == 0:
-
                 piece = piece.with_effects(
-                    [
-                        vfx.CrossFadeIn(
-                            0.08
-                        )
-                    ]
+                    [vfx.CrossFadeIn(0.08)]
                 )
-
         except Exception:
             pass
 
@@ -1105,63 +805,33 @@ def create_rapid_segments(
 
 
 # ============================================================
-# SFX
+# AUDIO
 # ============================================================
 
-def load_sfx(
-    effect_name
-):
-
+def load_sfx(effect_name):
     mapping = {
-
-        "whoosh":
-            WHOOSH_FILE,
-
-        "impact":
-            IMPACT_FILE,
-
-        "heartbeat":
-            HEARTBEAT_FILE,
-
-        "hit":
-            HIT_FILE,
+        "whoosh": WHOOSH_FILE,
+        "impact": IMPACT_FILE,
+        "heartbeat": HEARTBEAT_FILE,
+        "hit": HIT_FILE,
     }
 
-    file_path = mapping.get(
-        effect_name
-    )
+    file_path = mapping.get(effect_name)
 
-    if not file_path:
-        return None
-
-    if not file_path.exists():
+    if not file_path or not file_path.exists():
         return None
 
     return str(file_path)
 
 
-# ============================================================
-# AUDIO HELPERS
-# ============================================================
-
-def make_looped_audio(
-    audio,
-    duration,
-):
-
+def make_looped_audio(audio, duration):
     if audio.duration >= duration:
-
-        return audio.subclipped(
-            0,
-            duration,
-        )
+        return audio.subclipped(0, duration)
 
     pieces = []
-
     remaining = duration
 
     while remaining > 0:
-
         part_duration = min(
             audio.duration,
             remaining,
@@ -1176,36 +846,11 @@ def make_looped_audio(
 
         remaining -= part_duration
 
-    return concatenate_audio_clips(
-        pieces
-    )
-
-
-def concatenate_audio_clips(
-    clips
-):
-
-    """
-    MoviePy 2 compatible audio concatenation.
-    """
-
-    if not clips:
-        return None
-
-    if len(clips) == 1:
-        return clips[0]
-
-    from moviepy import (
-        concatenate_audioclips
-    )
-
-    return concatenate_audioclips(
-        clips
-    )
+    return concatenate_audioclips(pieces)
 
 
 # ============================================================
-# BUILD ONE SCENE
+# BUILD SCENE
 # ============================================================
 
 def build_scene(
@@ -1215,48 +860,36 @@ def build_scene(
     scene_number,
     sfx_name=None,
 ):
-
     print(
-        f"\n🎬 Building scene "
-        f"{scene_number}"
+        f"\n🎬 Building scene {scene_number}"
     )
 
     narration_audio = AudioFileClip(
         audio_path
     )
 
-    duration = (
-        narration_audio.duration
-    )
+    duration = narration_audio.duration
 
     source_video = VideoFileClip(
         video_path
     )
 
-    # --------------------------------------------------------
-    # Make sure video is long enough.
-    # --------------------------------------------------------
-
-    if (
-        source_video.duration <
-        duration
-    ):
-
-        loops = int(
-            duration /
-            max(
-                source_video.duration,
-                0.1,
-            )
-        ) + 1
+    if source_video.duration < duration:
+        loops = (
+            int(
+                duration /
+                max(
+                    source_video.duration,
+                    0.1,
+                )
+            ) + 1
+        )
 
         video = concatenate_videoclips(
             [source_video] * loops,
             method="compose",
         )
-
     else:
-
         video = source_video
 
     video = video.subclipped(
@@ -1267,17 +900,12 @@ def build_scene(
         ),
     )
 
-    # --------------------------------------------------------
-    # Rapid visual changes
-    # --------------------------------------------------------
-
     rapid_segments = create_rapid_segments(
         video,
         duration,
     )
 
     if rapid_segments:
-
         video = concatenate_videoclips(
             rapid_segments,
             method="compose",
@@ -1290,16 +918,10 @@ def build_scene(
                 video.duration,
             ),
         )
-
     else:
-
         video = prepare_clip_for_shorts(
             video
         )
-
-    # --------------------------------------------------------
-    # Caption
-    # --------------------------------------------------------
 
     caption_file = (
         CAPTION_DIR /
@@ -1309,143 +931,73 @@ def build_scene(
     create_caption_image(
         caption,
         str(caption_file),
-        emphasis=(
-            scene_number == 1
-        ),
+        emphasis=(scene_number == 1),
     )
 
     caption_image = (
         Image.open(
             caption_file
-        )
-        .convert("RGBA")
+        ).convert("RGBA")
     )
 
     caption_array = __import__(
         "numpy"
-    ).array(
-        caption_image
-    )
-
-    from moviepy import ImageClip
+    ).array(caption_image)
 
     caption_clip = (
-        ImageClip(
-            caption_array
-        )
-        .with_duration(
-            duration
-        )
-        .with_position(
-            ("center", "center")
-        )
+        ImageClip(caption_array)
+        .with_duration(duration)
+        .with_position(("center", "center"))
     )
 
-    # --------------------------------------------------------
-    # Add audio
-    # --------------------------------------------------------
+    audio_layers = [narration_audio]
 
-    audio_layers = [
-        narration_audio
-    ]
-
-    sfx_file = load_sfx(
-        sfx_name
-    )
+    sfx_file = load_sfx(sfx_name)
 
     if sfx_file:
-
         try:
+            sfx = AudioFileClip(sfx_file)
+            sfx = sfx.with_volume_scaled(0.28)
 
-            sfx = AudioFileClip(
-                sfx_file
-            )
-
-            sfx = sfx.with_volume_scaled(
-                0.28
-            )
-
-            # Place SFX near beginning
-            # for impact.
             if sfx.duration > 0.9:
-
                 sfx = sfx.subclipped(
                     0,
-                    min(
-                        0.9,
-                        sfx.duration,
-                    )
+                    min(0.9, sfx.duration),
                 )
 
-            sfx = sfx.with_start(
-                0.02
-            )
-
-            audio_layers.append(
-                sfx
-            )
+            sfx = sfx.with_start(0.02)
+            audio_layers.append(sfx)
 
         except Exception as e:
+            print("⚠️ SFX skipped:", e)
 
-            print(
-                "⚠️ SFX skipped:",
-                e,
-            )
-
-    combined_audio = (
-        CompositeAudioClip(
-            audio_layers
-        )
+    combined_audio = CompositeAudioClip(
+        audio_layers
     )
-
-    # --------------------------------------------------------
-    # Composite video + caption
-    # --------------------------------------------------------
-
-    from moviepy import CompositeVideoClip
 
     final_scene = CompositeVideoClip(
-        [
-            video,
-            caption_clip,
-        ],
-        size=(
-            VIDEO_WIDTH,
-            VIDEO_HEIGHT,
-        ),
+        [video, caption_clip],
+        size=(VIDEO_WIDTH, VIDEO_HEIGHT),
     )
 
-    final_scene = final_scene.with_audio(
+    return final_scene.with_audio(
         combined_audio
     )
-
-    return final_scene
 
 
 # ============================================================
 # BGM
 # ============================================================
 
-def add_background_music(
-    final_video
-):
-
-    if not os.path.exists(
-        BGM_FILE
-    ):
-
-        print(
-            "⚠️ bgm.mp3 not found."
-        )
-
+def add_background_music(final_video):
+    if not BGM_FILE.exists():
+        print("⚠️ bgm.mp3 not found.")
         return final_video
 
-    print(
-        "🎵 Adding suspense BGM..."
-    )
+    print("🎵 Adding suspense BGM...")
 
     bgm = AudioFileClip(
-        BGM_FILE
+        str(BGM_FILE)
     )
 
     bgm = make_looped_audio(
@@ -1453,47 +1005,30 @@ def add_background_music(
         final_video.duration,
     )
 
-    # Keep narration clearly audible.
-    bgm = bgm.with_volume_scaled(
-        0.045
-    )
+    bgm = bgm.with_volume_scaled(0.045)
 
     if final_video.audio:
-
         audio = CompositeAudioClip(
             [
                 final_video.audio,
                 bgm,
             ]
         )
-
     else:
-
         audio = bgm
 
-    return final_video.with_audio(
-        audio
-    )
+    return final_video.with_audio(audio)
 
 
 # ============================================================
 # THUMBNAIL
 # ============================================================
 
-def create_thumbnail(
-    video_path,
-    title,
-):
+def create_thumbnail(video_path, title):
+    print("\n🖼️ Creating thumbnail...")
 
-    print(
-        "\n🖼️ Creating thumbnail..."
-    )
+    video = VideoFileClip(video_path)
 
-    video = VideoFileClip(
-        video_path
-    )
-
-    # Select a dramatic early frame.
     frame_time = min(
         1.5,
         max(
@@ -1502,52 +1037,32 @@ def create_thumbnail(
         ),
     )
 
-    frame = video.get_frame(
-        frame_time
+    frame = video.get_frame(frame_time)
+
+    image = (
+        Image.fromarray(frame)
+        .convert("RGB")
+        .resize((1280, 720))
+        .filter(ImageFilter.SHARPEN)
     )
 
-    image = Image.fromarray(
-        frame
-    ).convert("RGB")
-
-    image = image.resize(
-        (
-            1280,
-            720,
-        )
-    )
-
-    # Dramatic contrast.
-    image = image.filter(
-        ImageFilter.SHARPEN
-    )
-
-    draw = ImageDraw.Draw(
-        image
-    )
-
+    draw = ImageDraw.Draw(image)
     font_path = find_font()
 
     if font_path:
-
         font = ImageFont.truetype(
             font_path,
             72,
         )
-
     else:
-
         font = ImageFont.load_default()
 
-    # Short thumbnail text.
-    words = title.split()
+    words = str(title).split()
 
     if len(words) > 6:
         words = words[:6]
 
-    thumbnail_text = " ".join(
-        words
-    )
+    thumbnail_text = " ".join(words)
 
     bbox = draw.textbbox(
         (0, 0),
@@ -1555,19 +1070,9 @@ def create_thumbnail(
         font=font,
     )
 
-    text_width = (
-        bbox[2] -
-        bbox[0]
-    )
-
-    x = (
-        1280 -
-        text_width
-    ) // 2
-
+    text_width = bbox[2] - bbox[0]
+    x = (1280 - text_width) // 2
     y = 530
-
-    # Dark backing.
     padding = 22
 
     draw.rounded_rectangle(
@@ -1578,19 +1083,11 @@ def create_thumbnail(
             y + 100,
         ),
         radius=20,
-        fill=(
-            0,
-            0,
-            0,
-            190,
-        ),
+        fill=(0, 0, 0, 190),
     )
 
     draw.text(
-        (
-            x,
-            y,
-        ),
+        (x, y),
         thumbnail_text,
         font=font,
         fill="white",
@@ -1610,22 +1107,16 @@ def create_thumbnail(
 
     video.close()
 
-    print(
-        "✅ Thumbnail:",
-        output,
-    )
+    print("✅ Thumbnail:", output)
 
     return str(output)
 
 
 # ============================================================
-# FULL VIDEO
+# ASSEMBLE FULL SHORT
 # ============================================================
 
-def assemble_video(
-    story
-):
-
+def assemble_video(story):
     print("\n" + "=" * 75)
     print("🎞️ BUILDING HIGH-RETENTION SHORT")
     print("=" * 75)
@@ -1633,45 +1124,15 @@ def assemble_video(
     scene_clips = []
 
     for scene in story["scenes"]:
+        number = scene["scene_number"]
+        query = scene["pexels_query"]
+        narration = scene["narration"]
+        caption = scene.get("caption", "")
+        sfx = scene.get("sfx")
 
-        number = scene[
-            "scene_number"
-        ]
-
-        query = scene[
-            "pexels_query"
-        ]
-
-        narration = scene[
-            "narration"
-        ]
-
-        caption = scene.get(
-            "caption",
-            "",
-        )
-
-        sfx = scene.get(
-            "sfx"
-        )
-
-        print(
-            f"\n🎥 SCENE {number}"
-        )
-
-        print(
-            "Visual:",
-            query
-        )
-
-        print(
-            "Narration:",
-            narration
-        )
-
-        # ----------------------------------------------------
-        # Download video.
-        # ----------------------------------------------------
+        print(f"\n🎥 SCENE {number}")
+        print("Visual:", query)
+        print("Narration:", narration)
 
         video_file = get_scene_video(
             number,
@@ -1679,205 +1140,290 @@ def assemble_video(
         )
 
         if not video_file:
-
             print(
-                f"⚠️ Scene {number} "
-                "could not be downloaded."
+                f"⚠️ Scene {number} could not be downloaded."
             )
-
             continue
 
-        # ----------------------------------------------------
-        # Voice.
-        # ----------------------------------------------------
+        try:
+            audio_file = generate_voice(
+                narration,
+                number,
+            )
 
-        audio_file = generate_voice(
-            narration,
-            number,
-        )
+            clip = build_scene(
+                video_file,
+                audio_file,
+                caption,
+                number,
+                sfx,
+            )
 
-        # ----------------------------------------------------
-        # Build scene.
-        # ----------------------------------------------------
+            scene_clips.append(clip)
 
-        clip = build_scene(
-            video_file,
-            audio_file,
-            caption,
-            number,
-            sfx,
-        )
-
-        scene_clips.append(
-            clip
-        )
+        except Exception as e:
+            print(
+                f"⚠️ Scene {number} build failed:",
+                e,
+            )
 
     if not scene_clips:
-
         raise RuntimeError(
             "❌ No video scenes available."
         )
 
-    print(
-        "\n🔗 Joining all scenes..."
-    )
+    print("\n🔗 Joining all scenes...")
 
     final_video = concatenate_videoclips(
         scene_clips,
         method="compose",
     )
 
-    # --------------------------------------------------------
-    # Add BGM.
-    # --------------------------------------------------------
-
     final_video = add_background_music(
         final_video
     )
-
-    # --------------------------------------------------------
-    # Export.
-    # --------------------------------------------------------
 
     output = (
         OUTPUT_DIR /
         "mystery_short.mp4"
     )
 
-    print(
-        "\n📤 Exporting:",
-        output,
-    )
+    print("\n📤 Exporting:", output)
 
     final_video.write_videofile(
-
         str(output),
-
         fps=FPS,
-
         codec="libx264",
-
         audio_codec="aac",
-
         preset="medium",
-
         bitrate="8M",
-
         pixel_format="yuv420p",
-
         threads=4,
     )
 
-    duration = (
-        final_video.duration
-    )
+    duration = final_video.duration
 
     final_video.close()
 
     for clip in scene_clips:
-
         try:
             clip.close()
         except Exception:
             pass
 
-    print(
-        "\n🎉 VIDEO CREATED"
-    )
-
+    print("\n🎉 VIDEO CREATED")
     print(
         "⏱️ Duration:",
         round(duration, 2),
         "seconds",
     )
-
-    print(
-        "📁",
-        output,
-    )
+    print("📁", output)
 
     return str(output)
 
 
 # ============================================================
-# YOUTUBE AUTH
+# YOUTUBE AUTHENTICATION
+#
+# IMPORTANT:
+# LOCAL:
+#   token.json + browser OAuth
+#
+# GITHUB ACTIONS:
+#   YOUTUBE_TOKEN_JSON secret
+#   NO browser
 # ============================================================
 
 def get_youtube_service():
-
-    scopes = [
-        "https://www.googleapis.com/auth/youtube.upload"
-    ]
+    scopes = [YOUTUBE_SCOPE]
 
     credentials = None
 
+    running_on_github = (
+        os.getenv(
+            "GITHUB_ACTIONS",
+            ""
+        ).lower() == "true"
+    )
+
+    print(
+        "\n🔐 YouTube authentication mode:",
+        "GITHUB ACTIONS" if running_on_github else "LOCAL PC",
+    )
+
     # --------------------------------------------------------
-    # Existing token.
+    # GITHUB: Load token from secret
     # --------------------------------------------------------
 
-    if os.path.exists(
-        TOKEN_FILE
-    ):
-
-        print(
-            "🔐 Loading YouTube token..."
+    if running_on_github:
+        token_json = os.getenv(
+            "YOUTUBE_TOKEN_JSON"
         )
 
-        credentials = (
-            Credentials.from_authorized_user_file(
-                TOKEN_FILE,
-                scopes,
-            )
-        )
-
-    # --------------------------------------------------------
-    # Local first-time login.
-    # --------------------------------------------------------
-
-    if (
-        credentials is None
-        or not credentials.valid
-    ):
-
-        if not os.path.exists(
-            CLIENT_SECRET_FILE
-        ):
-
+        if not token_json:
             raise RuntimeError(
-                "client_secret.json missing."
+                "\n❌ YOUTUBE_TOKEN_JSON GitHub Secret is missing.\n"
+                "Add the complete contents of your local token.json "
+                "as the YOUTUBE_TOKEN_JSON repository secret."
             )
 
+        try:
+            token_data = json.loads(token_json)
+
+            credentials = (
+                Credentials.from_authorized_user_info(
+                    token_data,
+                    scopes,
+                )
+            )
+
+            print(
+                "✅ YouTube token loaded from GitHub Secret."
+            )
+
+        except Exception as e:
+            raise RuntimeError(
+                "❌ YOUTUBE_TOKEN_JSON is invalid.\n"
+                f"Details: {e}"
+            )
+
+    # --------------------------------------------------------
+    # LOCAL: Load token.json
+    # --------------------------------------------------------
+
+    if credentials is None and TOKEN_FILE.exists():
+        print("🔐 Loading local YouTube token...")
+
+        try:
+            credentials = (
+                Credentials.from_authorized_user_file(
+                    str(TOKEN_FILE),
+                    scopes,
+                )
+            )
+
+            print("✅ Local token loaded.")
+
+        except Exception as e:
+            print(
+                "⚠️ Local token could not be loaded:",
+                e,
+            )
+
+            credentials = None
+
+    # --------------------------------------------------------
+    # Refresh expired credentials
+    # --------------------------------------------------------
+
+    if credentials is not None and credentials.expired:
+        if credentials.refresh_token:
+            print("🔄 Refreshing YouTube token...")
+
+            try:
+                credentials.refresh(Request())
+
+                print("✅ YouTube token refreshed.")
+
+                # Never write secrets back to GitHub.
+                if not running_on_github:
+                    TOKEN_FILE.write_text(
+                        credentials.to_json(),
+                        encoding="utf-8",
+                    )
+
+            except Exception as e:
+                print(
+                    "❌ Token refresh failed:",
+                    e,
+                )
+
+                credentials = None
+
+        else:
+            print(
+                "⚠️ Expired token has no refresh token."
+            )
+            credentials = None
+
+    # --------------------------------------------------------
+    # Valid credentials
+    # --------------------------------------------------------
+
+    if credentials is not None and credentials.valid:
         print(
-            "🔑 Starting YouTube OAuth..."
+            "✅ YouTube authentication ready."
         )
 
-        flow = (
-            InstalledAppFlow.from_client_secrets_file(
-                CLIENT_SECRET_FILE,
-                scopes,
-            )
+        return build(
+            "youtube",
+            "v3",
+            credentials=credentials,
+            cache_discovery=False,
         )
 
-        credentials = (
-            flow.run_local_server(
-                port=0
-            )
+    # --------------------------------------------------------
+    # NEVER run browser OAuth on GitHub
+    # --------------------------------------------------------
+
+    if running_on_github:
+        raise RuntimeError(
+            "\n❌ YouTube authentication failed in GitHub Actions.\n"
+            "\n"
+            "The GitHub runner must NOT open a browser.\n"
+            "Make sure YOUTUBE_TOKEN_JSON contains the COMPLETE "
+            "contents of a valid local token.json.\n"
         )
 
-        with open(
-            TOKEN_FILE,
-            "w",
-            encoding="utf-8",
-        ) as token:
+    # --------------------------------------------------------
+    # LOCAL FIRST-TIME OAuth
+    # --------------------------------------------------------
 
-            token.write(
-                credentials.to_json()
-            )
+    if not CLIENT_SECRET_FILE.exists():
+        raise RuntimeError(
+            "\n❌ client_secret.json missing.\n"
+            "\n"
+            "Put client_secret.json beside yt_animation_test.py "
+            "on your local PC."
+        )
+
+    print(
+        "\n🔑 Starting LOCAL YouTube OAuth..."
+    )
+
+    print(
+        "🌐 Browser OAuth is allowed ONLY on your local PC."
+    )
+
+    flow = (
+        InstalledAppFlow.from_client_secrets_file(
+            str(CLIENT_SECRET_FILE),
+            scopes,
+        )
+    )
+
+    credentials = flow.run_local_server(
+        port=0
+    )
+
+    TOKEN_FILE.write_text(
+        credentials.to_json(),
+        encoding="utf-8",
+    )
+
+    print(
+        "✅ YouTube OAuth successful."
+    )
+
+    print(
+        "💾 token.json created."
+    )
 
     return build(
         "youtube",
         "v3",
         credentials=credentials,
+        cache_discovery=False,
     )
 
 
@@ -1891,31 +1437,24 @@ def upload_to_youtube(
     description,
     thumbnail_path=None,
 ):
-
-    print(
-        "\n📤 UPLOADING TO YOUTUBE..."
-    )
+    print("\n📤 UPLOADING TO YOUTUBE...")
 
     youtube = get_youtube_service()
 
-    final_title = title[:100]
+    final_title = str(
+        title or "Indian Mystery Short #Shorts"
+    )[:100]
 
     final_description = (
-        description
+        str(description or "")
         + "\n\n"
         + "#Shorts #IndianMystery #IndianHistory #IndiaFacts"
     )
 
     body = {
-
         "snippet": {
-
-            "title":
-                final_title,
-
-            "description":
-                final_description,
-
+            "title": final_title,
+            "description": final_description,
             "tags": [
                 "Shorts",
                 "Indian Mystery",
@@ -1930,27 +1469,22 @@ def upload_to_youtube(
                 "Ancient India",
                 "Indian History Facts",
             ],
-
-            "categoryId":
-                "27",
+            "categoryId": "27",
         },
-
         "status": {
-
-            "privacyStatus":
-                "public",
-
-            "selfDeclaredMadeForKids":
-                False,
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
         },
     }
 
     media = MediaFileUpload(
         video_path,
-        chunksize=-1,
+        chunksize=8 * 1024 * 1024,
         resumable=True,
         mimetype="video/mp4",
     )
+
+    print("📤 Sending video to YouTube...")
 
     request = youtube.videos().insert(
         part="snippet,status",
@@ -1959,30 +1493,25 @@ def upload_to_youtube(
     )
 
     response = request.execute()
+    video_id = response.get("id")
 
-    video_id = response.get(
-        "id"
-    )
+    if not video_id:
+        raise RuntimeError(
+            "YouTube upload returned no video ID."
+        )
 
+    print("\n🎉 YOUTUBE UPLOAD SUCCESS")
+    print("🆔 Video ID:", video_id)
     print(
-        "\n🎉 YOUTUBE UPLOAD SUCCESS"
+        "🔗 https://www.youtube.com/watch?v="
+        + video_id
     )
 
-    print(
-        "🆔 Video ID:",
-        video_id,
-    )
-
-    # --------------------------------------------------------
-    # Thumbnail
-    # --------------------------------------------------------
-
-    if thumbnail_path and os.path.exists(
+    if (
         thumbnail_path
+        and os.path.exists(thumbnail_path)
     ):
-
         try:
-
             print(
                 "🖼️ Uploading custom thumbnail..."
             )
@@ -2000,7 +1529,6 @@ def upload_to_youtube(
             )
 
         except Exception as e:
-
             print(
                 "⚠️ Thumbnail upload failed:",
                 e,
@@ -2010,31 +1538,26 @@ def upload_to_youtube(
 
 
 # ============================================================
-# CLEANUP OLD TEMP FILES
+# CLEANUP
 # ============================================================
 
 def cleanup_old_scene_files():
-
     print(
         "\n🧹 Cleaning old temporary files..."
     )
 
-    for folder in [
+    for folder in (
         CLIPS_DIR,
         AUDIO_DIR,
         CAPTION_DIR,
-    ]:
-
+    ):
         if not folder.exists():
             continue
 
         for item in folder.iterdir():
-
             try:
-
                 if item.is_file():
                     item.unlink()
-
             except Exception:
                 pass
 
@@ -2044,47 +1567,21 @@ def cleanup_old_scene_files():
 # ============================================================
 
 def main():
-
     print("\n")
     print("=" * 75)
-    print("🇮🇳 INDIA-ONLY DARK HISTORY & MYSTERY SHORTS AUTOBOT")
+    print(
+        "🇮🇳 INDIA-ONLY DARK HISTORY & MYSTERY SHORTS AUTOBOT"
+    )
     print("=" * 75)
-    print(
-        "🎙️ Male Hindi Voice:",
-        VOICE,
-    )
-    print(
-        "⚡ Voice Speed:",
-        VOICE_RATE,
-    )
-    print(
-        "🎬 Format:",
-        "1080x1920",
-    )
-    print(
-        "📱 Shorts:",
-        "9:16",
-    )
-    print(
-        "✂️ Rapid Cuts:",
-        "Enabled",
-    )
-    print(
-        "💥 SFX:",
-        "Enabled when files exist",
-    )
-    print(
-        "📝 Captions:",
-        "Enabled",
-    )
-    print(
-        "🖼️ Thumbnail:",
-        "Enabled",
-    )
-    print(
-        "▶️ YouTube Upload:",
-        "Enabled",
-    )
+    print("🎙️ Male Hindi Voice:", VOICE)
+    print("⚡ Voice Speed:", VOICE_RATE)
+    print("🎬 Format:", "1080x1920")
+    print("📱 Shorts:", "9:16")
+    print("✂️ Rapid Cuts:", "Enabled")
+    print("💥 SFX:", "Enabled when files exist")
+    print("📝 Captions:", "Enabled")
+    print("🖼️ Thumbnail:", "Enabled")
+    print("▶️ YouTube Upload:", "Enabled")
     print(
         "🇮🇳 Niche:",
         "INDIA ONLY — Indian Facts / History / Mysteries",
@@ -2092,10 +1589,6 @@ def main():
     print("=" * 75)
 
     cleanup_old_scene_files()
-
-    # --------------------------------------------------------
-    # Generate story.
-    # --------------------------------------------------------
 
     story = generate_mystery_story()
 
@@ -2108,32 +1601,14 @@ def main():
         )
     )
 
-    # --------------------------------------------------------
-    # Build video.
-    # --------------------------------------------------------
-
-    video_path = assemble_video(
-        story
-    )
-
-    # --------------------------------------------------------
-    # Thumbnail.
-    # --------------------------------------------------------
+    video_path = assemble_video(story)
 
     thumbnail = create_thumbnail(
         video_path,
-        story.get(
-            "title",
-            "Mystery",
-        ),
+        story.get("title", "Mystery"),
     )
 
-    # --------------------------------------------------------
-    # YouTube.
-    # --------------------------------------------------------
-
     try:
-
         upload_to_youtube(
             video_path,
             story.get(
@@ -2148,29 +1623,21 @@ def main():
         )
 
     except Exception as e:
-
         print(
             "\n⚠️ YouTube upload skipped/failed:"
         )
-
         print(e)
 
     print("\n" + "=" * 75)
     print("🎉 COMPLETE")
     print("=" * 75)
-
     print(
         "🎬 Video:",
-        os.path.abspath(
-            video_path
-        ),
+        os.path.abspath(video_path),
     )
-
     print(
         "🖼️ Thumbnail:",
-        os.path.abspath(
-            thumbnail
-        ),
+        os.path.abspath(thumbnail),
     )
 
 
@@ -2179,13 +1646,10 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     try:
-
         main()
 
     except Exception as e:
-
         print("\n" + "=" * 75)
         print("❌ FATAL ERROR")
         print("=" * 75)
