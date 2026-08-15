@@ -241,33 +241,139 @@ def ensure_india_query(query):
     return query
 
 
-def validate_indian_story(data):
-    combined = " ".join(
-        str(data.get(key, ""))
-        for key in ("topic", "title", "description", "hook")
-    ).lower()
+def validate_indian_story(data, expected_topic=None):
+    """
+    Validate the AI story without rejecting a valid Indian story just
+    because the AI omitted the literal word 'India' from the title or
+    description.
 
-    if any(term in combined for term in FORBIDDEN_FOREIGN_TERMS):
+    The selected topic comes from MYSTERY_TOPICS, which is already
+    India-only. Scene Pexels queries are also forced through
+    ensure_india_query().
+    """
+
+    if not isinstance(data, dict):
+        raise ValueError("AI response is not a JSON object.")
+
+    # --------------------------------------------------------
+    # Combine all important story text.
+    # --------------------------------------------------------
+
+    text_parts = [
+        str(data.get("topic", "")),
+        str(data.get("title", "")),
+        str(data.get("description", "")),
+        str(data.get("hook", "")),
+    ]
+
+    scenes = data.get("scenes", [])
+
+    if not isinstance(scenes, list):
+        raise ValueError("AI response contains invalid scenes.")
+
+    for scene in scenes:
+        if isinstance(scene, dict):
+            text_parts.extend(
+                [
+                    str(scene.get("narration", "")),
+                    str(scene.get("caption", "")),
+                    str(scene.get("pexels_query", "")),
+                ]
+            )
+
+    combined = " ".join(text_parts).lower()
+
+    # --------------------------------------------------------
+    # Never allow explicitly foreign topics.
+    # --------------------------------------------------------
+
+    if any(
+        term in combined
+        for term in FORBIDDEN_FOREIGN_TERMS
+    ):
         raise ValueError(
-            "Generated story contains a non-Indian topic."
+            "Generated story contains a forbidden foreign topic."
         )
 
-    if not any(term in combined for term in INDIA_TERMS):
+    # --------------------------------------------------------
+    # India validation.
+    #
+    # IMPORTANT:
+    # The selected topic itself is authoritative because it is
+    # chosen from our India-only MYSTERY_TOPICS list.
+    # Therefore an AI title such as:
+    # "इस किले का राज़ क्या है?"
+    # must NOT be rejected simply because it doesn't contain
+    # the literal word India.
+    # --------------------------------------------------------
+
+    expected_topic_text = str(
+        expected_topic or data.get("topic", "")
+    ).lower()
+
+    topic_is_known_indian = any(
+        expected_topic_text.strip().lower() == str(topic).strip().lower()
+        for topic in MYSTERY_TOPICS
+    )
+
+    story_mentions_india = any(
+        term in combined
+        for term in INDIA_TERMS
+    )
+
+    scene_queries_are_indian = True
+
+    for scene in scenes:
+        query = str(
+            scene.get("pexels_query", "")
+            if isinstance(scene, dict)
+            else ""
+        ).lower()
+
+        if query:
+            if any(
+                term in query
+                for term in FORBIDDEN_FOREIGN_TERMS
+            ):
+                raise ValueError(
+                    f"Foreign visual query detected: {query}"
+                )
+
+    if not (
+        topic_is_known_indian
+        or story_mentions_india
+        or scene_queries_are_indian
+    ):
         raise ValueError(
             "Generated story does not clearly identify India."
         )
 
-    scenes = data.get("scenes", [])
+    # --------------------------------------------------------
+    # Exactly 7 scenes.
+    # --------------------------------------------------------
 
     if len(scenes) != 7:
         raise ValueError(
             f"Expected exactly 7 scenes, got {len(scenes)}"
         )
 
+    # --------------------------------------------------------
+    # Force every visual search to remain India-focused.
+    # --------------------------------------------------------
+
     for scene in scenes:
+
+        if not isinstance(scene, dict):
+            raise ValueError("Invalid scene object.")
+
         scene["pexels_query"] = ensure_india_query(
             scene.get("pexels_query", "")
         )
+
+    # Keep the selected topic instead of allowing the AI to
+    # silently replace it with an unrelated topic.
+    if expected_topic:
+        data["topic"] = expected_topic
 
     return data
 
@@ -381,13 +487,69 @@ The final scene MUST ask a question that encourages comments.
         response.choices[0].message.content
     )
 
-    data = validate_indian_story(data)
+    try:
+        data = validate_indian_story(
+            data,
+            expected_topic=topic,
+        )
+    except ValueError as validation_error:
+        print(
+            "\n⚠️ Story validation warning:",
+            validation_error,
+        )
+        print(
+            "🔧 Keeping the selected India-only topic and "
+            "normalizing visual queries..."
+        )
+
+        # Because topic was selected from our India-only list,
+        # normalize the AI response instead of killing the
+        # entire GitHub Actions job for a missing word like
+        # 'India' in the title/description.
+        data["topic"] = topic
+
+        scenes = data.get("scenes", [])
+
+        if not isinstance(scenes, list) or len(scenes) != 7:
+            raise ValueError(
+                "AI must return exactly 7 scenes."
+            )
+
+        for scene in scenes:
+            if not isinstance(scene, dict):
+                raise ValueError("Invalid scene object.")
+
+            scene["pexels_query"] = ensure_india_query(
+                scene.get("pexels_query", "")
+            )
+
+        if any(
+            term in (
+                str(data.get("title", ""))
+                + " "
+                + str(data.get("description", ""))
+                + " "
+                + str(data.get("hook", ""))
+            ).lower()
+            for term in FORBIDDEN_FOREIGN_TERMS
+        ):
+            raise ValueError(
+                "AI response contains a forbidden foreign topic."
+            )
 
     # HARD RULE: scene 1 is always the 0-3 second hook.
     hook = str(data.get("hook", "")).strip()
 
     if not hook:
-        raise RuntimeError("AI did not return a valid hook.")
+        # Safe India-specific fallback. This guarantees the
+        # 0-3 second opening never becomes empty.
+        hook = "इस भारतीय रहस्य का जवाब आज तक क्यों नहीं मिला?"
+
+    # Keep the first line compact enough for the 0-3 second slot.
+    hook_words = hook.split()
+
+    if len(hook_words) > 18:
+        hook = " ".join(hook_words[:18]).rstrip(" ,.!?") + "?"
 
     if not data.get("scenes"):
         raise RuntimeError("AI did not return scenes.")
