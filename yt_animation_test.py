@@ -26,6 +26,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -72,6 +73,11 @@ HEARTBEAT_FILE = SFX_DIR / "heartbeat.mp3"
 HIT_FILE = SFX_DIR / "hit.mp3"
 
 TOKEN_FILE = Path("token.json")
+
+# GitHub Actions secret names supported by this script.
+# Recommended: YOUTUBE_TOKEN_JSON
+# Also supported: TOKEN_JSON
+GITHUB_TOKEN_SECRET_NAMES = ("YOUTUBE_TOKEN_JSON", "TOKEN_JSON")
 CLIENT_SECRET_FILE = Path("client_secret.json")
 
 VIDEO_WIDTH = 1080
@@ -83,6 +89,12 @@ VOICE_RATE = "+16%"
 VOICE_PITCH = "-2Hz"
 
 YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+
+# YouTube / Shorts limits
+MAX_SHORT_DURATION = 35.0
+YOUTUBE_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+YOUTUBE_UPLOAD_MAX_RETRIES = 6
+
 
 
 # ============================================================
@@ -296,17 +308,30 @@ For uncertain claims use:
 Never invent dates, people, discoveries, scientific claims, quotes or evidence.
 Separate folklore from documented history.
 
-RETENTION:
-0-2 sec = powerful hook.
-2-6 sec = mystery setup.
-6-18 sec = clue chain.
-18-27 sec = strongest revelation.
-Final seconds = unanswered question.
+RETENTION — CRITICAL:
+0-3 SEC = EXTREMELY STRONG HOOK. This is the most important part.
+Scene 1 MUST start at 0 seconds and end at 3 seconds.
+Scene 1 narration MUST be EXACTLY the same as the "hook" field.
+The hook must be short enough to finish naturally within about 3 seconds.
+Keep the hook around 8-14 Hindi words.
+The hook must create an immediate curiosity gap and preferably mention a concrete Indian place, person, object, or discovery.
 
-Do not begin with:
+Strong hook examples:
+"भारत के इस किले का सबसे बड़ा राज़ क्या है?"
+"इस भारतीय मंदिर को बनाया कैसे गया?"
+"इस झील में मिले कंकालों का राज़ क्या है?"
+"राजस्थान की इस जगह पर रात में लोग क्यों नहीं जाते?"
+
+NEVER begin the hook with:
 "आज हम बात करेंगे..."
 "क्या आप जानते हैं..."
 "नमस्कार दोस्तों..."
+"दोस्तों आज की वीडियो में..."
+
+2-6 sec = mystery setup.
+6-18 sec = clue chain.
+18-27 sec = strongest documented revelation.
+Final seconds = unanswered question.
 
 Every pexels_query MUST target India or an Indian location.
 Never request foreign visuals.
@@ -357,6 +382,28 @@ The final scene MUST ask a question that encourages comments.
     )
 
     data = validate_indian_story(data)
+
+    # HARD RULE: scene 1 is always the 0-3 second hook.
+    hook = str(data.get("hook", "")).strip()
+
+    if not hook:
+        raise RuntimeError("AI did not return a valid hook.")
+
+    if not data.get("scenes"):
+        raise RuntimeError("AI did not return scenes.")
+
+    data["scenes"][0]["start_time"] = 0
+    data["scenes"][0]["end_time"] = 3
+    data["scenes"][0]["narration"] = hook
+    data["scenes"][0]["caption"] = (
+        data["scenes"][0].get("caption") or "राज़ क्या है?"
+    )
+    data["scenes"][0]["sfx"] = (
+        data["scenes"][0].get("sfx") or "impact"
+    )
+
+    print("\n🔥 0-3 SEC STRONG HOOK:")
+    print(hook)
 
     print("\n🎬 TITLE:")
     print(data.get("title", "Untitled"))
@@ -1131,6 +1178,9 @@ def assemble_video(story):
         sfx = scene.get("sfx")
 
         print(f"\n🎥 SCENE {number}")
+
+        if number == 1:
+            print("🔥 0-3 SEC STRONG HOOK")
         print("Visual:", query)
         print("Narration:", narration)
 
@@ -1182,6 +1232,23 @@ def assemble_video(story):
     final_video = add_background_music(
         final_video
     )
+
+    # --------------------------------------------------------
+    # HARD MAXIMUM: keep the final video inside Shorts target.
+    # Voice clips can make the assembled video longer than the
+    # AI-generated scene timestamps, so enforce the limit here.
+    # --------------------------------------------------------
+
+    if final_video.duration > MAX_SHORT_DURATION:
+        print(
+            f"\n✂️ Final video is {final_video.duration:.2f}s. "
+            f"Trimming to {MAX_SHORT_DURATION:.0f}s..."
+        )
+
+        final_video = final_video.subclipped(
+            0,
+            MAX_SHORT_DURATION,
+        )
 
     output = (
         OUTPUT_DIR /
@@ -1235,125 +1302,89 @@ def assemble_video(story):
 # ============================================================
 
 def get_youtube_service():
-    scopes = [YOUTUBE_SCOPE]
+
+    """
+    YouTube OAuth loader.
+
+    LOCAL:
+        Reads ./client_secret.json and ./token.json
+
+    GITHUB ACTIONS:
+        The workflow creates ./client_secret.json from the
+        CLIENT_SECRET_JSON GitHub Secret and ./token.json from
+        YOUTUBE_TOKEN_JSON / TOKEN_JSON.
+
+    IMPORTANT:
+        CLIENT_SECRET_JSON must contain the COMPLETE Google
+        OAuth client JSON, not only the client_secret string.
+    """
+
+    scopes = [
+        "https://www.googleapis.com/auth/youtube.upload"
+    ]
 
     credentials = None
 
-    running_on_github = (
-        os.getenv(
-            "GITHUB_ACTIONS",
-            ""
-        ).lower() == "true"
-    )
-
-    print(
-        "\n🔐 YouTube authentication mode:",
-        "GITHUB ACTIONS" if running_on_github else "LOCAL PC",
-    )
-
     # --------------------------------------------------------
-    # GITHUB: Load token from secret
+    # 1. Load existing token.json
     # --------------------------------------------------------
 
-    if running_on_github:
-        token_json = os.getenv(
-            "YOUTUBE_TOKEN_JSON"
-        )
+    if os.path.exists(TOKEN_FILE):
 
-        if not token_json:
-            raise RuntimeError(
-                "\n❌ YOUTUBE_TOKEN_JSON GitHub Secret is missing.\n"
-                "Add the complete contents of your local token.json "
-                "as the YOUTUBE_TOKEN_JSON repository secret."
-            )
+        print("🔐 Loading YouTube token.json...")
 
         try:
-            token_data = json.loads(token_json)
-
-            credentials = (
-                Credentials.from_authorized_user_info(
-                    token_data,
-                    scopes,
-                )
+            credentials = Credentials.from_authorized_user_file(
+                TOKEN_FILE,
+                scopes,
             )
-
-            print(
-                "✅ YouTube token loaded from GitHub Secret."
-            )
-
         except Exception as e:
-            raise RuntimeError(
-                "❌ YOUTUBE_TOKEN_JSON is invalid.\n"
-                f"Details: {e}"
-            )
-
-    # --------------------------------------------------------
-    # LOCAL: Load token.json
-    # --------------------------------------------------------
-
-    if credentials is None and TOKEN_FILE.exists():
-        print("🔐 Loading local YouTube token...")
-
-        try:
-            credentials = (
-                Credentials.from_authorized_user_file(
-                    str(TOKEN_FILE),
-                    scopes,
-                )
-            )
-
-            print("✅ Local token loaded.")
-
-        except Exception as e:
-            print(
-                "⚠️ Local token could not be loaded:",
-                e,
-            )
-
+            print("⚠️ token.json could not be loaded:", e)
             credentials = None
 
     # --------------------------------------------------------
-    # Refresh expired credentials
+    # 2. Refresh expired token automatically
     # --------------------------------------------------------
 
     if credentials is not None and credentials.expired:
+
         if credentials.refresh_token:
-            print("🔄 Refreshing YouTube token...")
+
+            print("🔄 Refreshing YouTube access token...")
 
             try:
+                from google.auth.transport.requests import Request
+
                 credentials.refresh(Request())
+
+                with open(
+                    TOKEN_FILE,
+                    "w",
+                    encoding="utf-8",
+                ) as token:
+
+                    token.write(
+                        credentials.to_json()
+                    )
 
                 print("✅ YouTube token refreshed.")
 
-                # Never write secrets back to GitHub.
-                if not running_on_github:
-                    TOKEN_FILE.write_text(
-                        credentials.to_json(),
-                        encoding="utf-8",
-                    )
-
             except Exception as e:
+
                 print(
-                    "❌ Token refresh failed:",
+                    "⚠️ Token refresh failed:",
                     e,
                 )
 
                 credentials = None
 
-        else:
-            print(
-                "⚠️ Expired token has no refresh token."
-            )
-            credentials = None
-
     # --------------------------------------------------------
-    # Valid credentials
+    # 3. If valid credentials exist, use them.
     # --------------------------------------------------------
 
     if credentials is not None and credentials.valid:
-        print(
-            "✅ YouTube authentication ready."
-        )
+
+        print("✅ YouTube OAuth token is valid.")
 
         return build(
             "youtube",
@@ -1363,61 +1394,63 @@ def get_youtube_service():
         )
 
     # --------------------------------------------------------
-    # NEVER run browser OAuth on GitHub
+    # 4. GitHub/local client_secret.json check
     # --------------------------------------------------------
 
-    if running_on_github:
+    if not os.path.exists(CLIENT_SECRET_FILE):
+
         raise RuntimeError(
-            "\n❌ YouTube authentication failed in GitHub Actions.\n"
             "\n"
-            "The GitHub runner must NOT open a browser.\n"
-            "Make sure YOUTUBE_TOKEN_JSON contains the COMPLETE "
-            "contents of a valid local token.json.\n"
+            "❌ client_secret.json missing.\n\n"
+            "For GitHub Actions, create a GitHub Secret named:\n"
+            "CLIENT_SECRET_JSON\n\n"
+            "The Secret must contain the COMPLETE contents of\n"
+            "Google's client_secret.json file.\n\n"
+            "The GitHub workflow will automatically create:\n"
+            "./client_secret.json\n"
+            "before this Python script runs.\n"
         )
 
     # --------------------------------------------------------
-    # LOCAL FIRST-TIME OAuth
+    # 5. Local first-time OAuth
     # --------------------------------------------------------
 
-    if not CLIENT_SECRET_FILE.exists():
+    print("🔑 Starting YouTube OAuth...")
+
+    flow = InstalledAppFlow.from_client_secrets_file(
+        CLIENT_SECRET_FILE,
+        scopes,
+    )
+
+    # GitHub Actions usually has no browser.
+    # Never attempt local browser OAuth in CI.
+    if os.getenv("GITHUB_ACTIONS", "").lower() == "true":
+
         raise RuntimeError(
-            "\n❌ client_secret.json missing.\n"
             "\n"
-            "Put client_secret.json beside yt_animation_test.py "
-            "on your local PC."
+            "❌ YouTube token.json is missing or expired in GitHub Actions.\n\n"
+            "GitHub cannot perform the first browser OAuth login.\n"
+            "Run the script locally once, complete Google OAuth,\n"
+            "then put the resulting token.json contents into the\n"
+            "GitHub Secret named YOUTUBE_TOKEN_JSON.\n"
         )
-
-    print(
-        "\n🔑 Starting LOCAL YouTube OAuth..."
-    )
-
-    print(
-        "🌐 Browser OAuth is allowed ONLY on your local PC."
-    )
-
-    flow = (
-        InstalledAppFlow.from_client_secrets_file(
-            str(CLIENT_SECRET_FILE),
-            scopes,
-        )
-    )
 
     credentials = flow.run_local_server(
-        port=0
+        port=0,
+        open_browser=True,
     )
 
-    TOKEN_FILE.write_text(
-        credentials.to_json(),
+    with open(
+        TOKEN_FILE,
+        "w",
         encoding="utf-8",
-    )
+    ) as token:
 
-    print(
-        "✅ YouTube OAuth successful."
-    )
+        token.write(
+            credentials.to_json()
+        )
 
-    print(
-        "💾 token.json created."
-    )
+    print("✅ YouTube token.json created.")
 
     return build(
         "youtube",
@@ -1430,6 +1463,199 @@ def get_youtube_service():
 # ============================================================
 # YOUTUBE UPLOAD
 # ============================================================
+
+def _is_retryable_youtube_error(error):
+    """Return True for temporary/network errors worth retrying."""
+
+    text = str(error).lower()
+
+    retry_terms = [
+        "10053",
+        "10054",
+        "10060",
+        "connection aborted",
+        "connection reset",
+        "connection broken",
+        "remote end closed",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "internal error",
+        "backend error",
+        "rate limit",
+        "too many requests",
+        "503",
+        "502",
+        "500",
+        "504",
+    ]
+
+    if any(term in text for term in retry_terms):
+        return True
+
+    if isinstance(error, HttpError):
+        try:
+            status = int(error.resp.status)
+            return status in {408, 429, 500, 502, 503, 504}
+        except Exception:
+            return False
+
+    return False
+
+
+def _upload_video_resumable(youtube, video_path, body):
+    """Upload a video using Google's resumable upload API with retries."""
+
+    media = MediaFileUpload(
+        str(video_path),
+        chunksize=YOUTUBE_UPLOAD_CHUNK_SIZE,
+        resumable=True,
+        mimetype="video/mp4",
+    )
+
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+    )
+
+    print(
+        "📦 Upload mode: resumable chunks of "
+        f"{YOUTUBE_UPLOAD_CHUNK_SIZE // (1024 * 1024)} MB"
+    )
+
+    response = None
+    last_error = None
+
+    while response is None:
+        try:
+            status, response = request.next_chunk()
+
+            if status is not None:
+                try:
+                    progress = int(status.progress() * 100)
+                    print(
+                        f"📤 YouTube upload progress: {progress}%",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+
+            if response is not None:
+                break
+
+        except Exception as error:
+            last_error = error
+
+            if not _is_retryable_youtube_error(error):
+                raise
+
+            # Google resumable requests keep the resumable upload URI in
+            # the request object. Calling next_chunk() again allows the
+            # library to continue the same resumable upload instead of
+            # starting a new normal upload request.
+            print(
+                "⚠️ Temporary YouTube upload/network error:"
+            )
+            print(error)
+
+            recovered = False
+
+            for retry in range(1, YOUTUBE_UPLOAD_MAX_RETRIES + 1):
+                delay = min(60, 2 ** retry)
+
+                print(
+                    f"🔄 Upload retry {retry}/"
+                    f"{YOUTUBE_UPLOAD_MAX_RETRIES} "
+                    f"in {delay}s..."
+                )
+
+                time.sleep(delay)
+
+                try:
+                    status, response = request.next_chunk()
+
+                    if status is not None:
+                        try:
+                            progress = int(status.progress() * 100)
+                            print(
+                                f"📤 YouTube upload progress: {progress}%",
+                                flush=True,
+                            )
+                        except Exception:
+                            pass
+
+                    recovered = True
+                    break
+
+                except Exception as retry_error:
+                    last_error = retry_error
+                    print(
+                        f"⚠️ Retry {retry} failed:",
+                        retry_error,
+                    )
+
+                    if not _is_retryable_youtube_error(
+                        retry_error
+                    ):
+                        raise
+
+            if not recovered:
+                raise RuntimeError(
+                    "YouTube resumable upload failed after "
+                    f"{YOUTUBE_UPLOAD_MAX_RETRIES} retries. "
+                    f"Last error: {last_error}"
+                ) from last_error
+
+    if not response or not response.get("id"):
+        raise RuntimeError(
+            "YouTube upload finished without a video ID."
+        )
+
+    return response["id"]
+
+
+def _upload_thumbnail_with_retry(youtube, video_id, thumbnail_path):
+    """Upload the custom thumbnail with a few network retries."""
+
+    if not thumbnail_path or not os.path.exists(thumbnail_path):
+        return
+
+    print("🖼️ Uploading custom thumbnail...")
+
+    last_error = None
+
+    for attempt in range(1, 4):
+        try:
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(
+                    str(thumbnail_path),
+                    mimetype="image/jpeg",
+                ),
+            ).execute()
+
+            print("✅ Thumbnail uploaded.")
+            return
+
+        except Exception as error:
+            last_error = error
+            print(
+                f"⚠️ Thumbnail attempt {attempt}/3 failed:",
+                error,
+            )
+
+            if attempt < 3 and _is_retryable_youtube_error(error):
+                time.sleep(2 * attempt)
+            else:
+                break
+
+    print(
+        "⚠️ Thumbnail upload failed after retries:",
+        last_error,
+    )
+
 
 def upload_to_youtube(
     video_path,
@@ -1477,28 +1703,21 @@ def upload_to_youtube(
         },
     }
 
-    media = MediaFileUpload(
+    file_size_mb = (
+        os.path.getsize(video_path) / (1024 * 1024)
+        if os.path.exists(video_path)
+        else 0
+    )
+
+    print(
+        f"🎬 Video size: {file_size_mb:.2f} MB"
+    )
+
+    video_id = _upload_video_resumable(
+        youtube,
         video_path,
-        chunksize=8 * 1024 * 1024,
-        resumable=True,
-        mimetype="video/mp4",
+        body,
     )
-
-    print("📤 Sending video to YouTube...")
-
-    request = youtube.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=media,
-    )
-
-    response = request.execute()
-    video_id = response.get("id")
-
-    if not video_id:
-        raise RuntimeError(
-            "YouTube upload returned no video ID."
-        )
 
     print("\n🎉 YOUTUBE UPLOAD SUCCESS")
     print("🆔 Video ID:", video_id)
@@ -1507,32 +1726,11 @@ def upload_to_youtube(
         + video_id
     )
 
-    if (
-        thumbnail_path
-        and os.path.exists(thumbnail_path)
-    ):
-        try:
-            print(
-                "🖼️ Uploading custom thumbnail..."
-            )
-
-            youtube.thumbnails().set(
-                videoId=video_id,
-                media_body=MediaFileUpload(
-                    thumbnail_path,
-                    mimetype="image/jpeg",
-                ),
-            ).execute()
-
-            print(
-                "✅ Thumbnail uploaded."
-            )
-
-        except Exception as e:
-            print(
-                "⚠️ Thumbnail upload failed:",
-                e,
-            )
+    _upload_thumbnail_with_retry(
+        youtube,
+        video_id,
+        thumbnail_path,
+    )
 
     return video_id
 
@@ -1575,6 +1773,7 @@ def main():
     print("=" * 75)
     print("🎙️ Male Hindi Voice:", VOICE)
     print("⚡ Voice Speed:", VOICE_RATE)
+    print("🔥 Hook:", "FORCED INTO SCENE 1 / 0-3 SEC")
     print("🎬 Format:", "1080x1920")
     print("📱 Shorts:", "9:16")
     print("✂️ Rapid Cuts:", "Enabled")
