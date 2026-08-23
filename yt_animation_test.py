@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import random
 import asyncio
@@ -7,12 +8,21 @@ import time
 import re
 from pathlib import Path
 
+# Ensure UTF-8 stdout on Windows to support emojis and Devanagari text in console logs
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 import requests
 from dotenv import load_dotenv
 from groq import Groq
 import edge_tts
 
+import numpy as np
 from moviepy import (
+    VideoClip,
     VideoFileClip,
     AudioFileClip,
     CompositeAudioClip,
@@ -40,6 +50,8 @@ load_dotenv()
 
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
+ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 
 if not GROQ_KEY:
     raise ValueError("GROQ_API_KEY missing.")
@@ -2032,7 +2044,7 @@ def download_video(
                     path,
                 )
 
-                return str(path)
+                return str(path.resolve())
 
         except Exception as e:
 
@@ -2064,17 +2076,33 @@ async def create_voice(
     text,
     output_file,
 ):
-
-    communicate = edge_tts.Communicate(
-        text=text,
-        voice=VOICE,
-        rate=VOICE_RATE,
-        pitch=VOICE_PITCH,
-    )
-
-    await communicate.save(
-        output_file
-    )
+    for attempt in range(1, 4):
+        try:
+            communicate = edge_tts.Communicate(
+                text=text,
+                voice=VOICE,
+                rate=VOICE_RATE,
+                pitch=VOICE_PITCH,
+            )
+            await communicate.save(output_file)
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
+                return True
+        except Exception as err:
+            print(f"⚠️ Edge-TTS attempt {attempt} failed: {err}")
+            await asyncio.sleep(1.5)
+            
+    # Fallback to gTTS if Edge-TTS network times out
+    try:
+        from gtts import gTTS
+        print("🎙️ Falling back to gTTS Hindi voice...")
+        tts = gTTS(text=text, lang="hi")
+        tts.save(output_file)
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
+            return True
+    except Exception as gerr:
+        print(f"⚠️ gTTS fallback error: {gerr}")
+        
+    return False
 
 
 def generate_voice(
@@ -2085,14 +2113,18 @@ def generate_voice(
     filename = (
         AUDIO_DIR
         / f"voice_{scene_number}.mp3"
-    )
+    ).resolve()
 
     print(
-        f"🎙️ Generating Hindi voice "
-        f"scene {scene_number}"
+        f"🎙️ Generating Natural Hindi voice for scene {scene_number}"
     )
 
-    asyncio.run(
+    # First try ElevenLabs if API key configured
+    if ELEVENLABS_KEY and generate_elevenlabs_voice(text, str(filename)):
+        return str(filename)
+
+    # Fallback to Edge-TTS / gTTS
+    success = asyncio.run(
         create_voice(
             text,
             str(filename),
@@ -2100,7 +2132,8 @@ def generate_voice(
     )
 
     if (
-        not filename.exists()
+        not success
+        or not filename.exists()
         or filename.stat().st_size < 1000
     ):
 
@@ -2470,6 +2503,265 @@ def create_sfx_layer(
 
 
 # ============================================================
+# MRBEAST DYNAMIC ANIMATED CAPTIONS (WHISPER POWERED)
+# ============================================================
+
+def get_whisper_word_timestamps(audio_path, narration_text=""):
+    """Extracts sub-second word level timestamps using Groq Whisper API with smart fallback."""
+    if not os.path.exists(audio_path):
+        return []
+    
+    try:
+        with open(audio_path, "rb") as f:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(os.path.basename(audio_path), f.read()),
+                model="whisper-large-v3",
+                response_format="verbose_json",
+                timestamp_granularities=["word"],
+            )
+        
+        words_data = getattr(transcription, "words", None)
+        if isinstance(transcription, dict):
+            words_data = transcription.get("words", [])
+            
+        if words_data and len(words_data) > 0:
+            parsed_words = []
+            for item in words_data:
+                w = item.get("word", "").strip()
+                s = float(item.get("start", 0.0))
+                e = float(item.get("end", s + 0.3))
+                if w:
+                    parsed_words.append({"word": w, "start": s, "end": e})
+            if parsed_words:
+                print(f"🎯 Whisper extracted {len(parsed_words)} word-level timestamps successfully.")
+                return parsed_words
+    except Exception as err:
+        print(f"⚠️ Whisper timestamp extraction warning: {err}")
+        
+    # Fallback timestamp estimation if Whisper unavailable
+    words = re.findall(r'\S+', narration_text) if narration_text else []
+    if not words:
+        return []
+        
+    try:
+        clip = AudioFileClip(audio_path)
+        total_dur = clip.duration
+        clip.close()
+    except Exception:
+        total_dur = len(words) * 0.4
+        
+    avg_dur = total_dur / max(len(words), 1)
+    fallback_words = []
+    current_time = 0.0
+    for w in words:
+        w_dur = max(0.2, avg_dur)
+        fallback_words.append({"word": w, "start": round(current_time, 2), "end": round(current_time + w_dur, 2)})
+        current_time += w_dur
+    return fallback_words
+
+
+# ============================================================
+# CONTEXT-DRIVEN DYNAMIC EMOJI MATCHER & KINETIC CAPTIONS
+# ============================================================
+
+CONTEXT_EMOJI_MAP = {
+    ("किला", "महल", "मंदिर", "इमारत", "मीनार", "मस्जिद", "भवन", "fort", "castle", "palace", "temple", "monument", "building", "kila", "mahal", "mandir"): "🏛️",
+    ("भूत", "साया", "आत्मा", "श्राप", "मौत", "कंकाल", "लाश", "डरावना", "खौफ", "हॉन्टेड", "ghost", "haunted", "curse", "death", "skeleton", "scary", "bhoot", "aatma", "shraap", "maut"): "💀",
+    ("रहस्य", "गुप्त", "छुपा", "पहेली", "अनसुलझा", "mystery", "secret", "hidden", "unexplained", "puzzle", "rahasya", "gupt", "chupa"): "🕵️",
+    ("खजाना", "सोना", "पैसा", "धन", "दौलत", "हीरा", "जवाहरात", "treasure", "gold", "money", "rich", "diamond", "khazana", "sona", "paisa"): "💰",
+    ("आग", "अग्नि", "धमाका", "ज्वाला", "fire", "burn", "flame", "explosion", "aag"): "🔥",
+    ("समुद्र", "नदी", "झील", "पानी", "सागर", "बारिश", "sea", "ocean", "river", "lake", "water", "rain", "samudra", "nadi", "paani"): "🌊",
+    ("युद्ध", "सेना", "लड़ाई", "तलवार", "हमला", "सिपाही", "जंग", "war", "fight", "sword", "army", "battle", "attack", "yuddh", "sena", "ladai", "talwar"): "⚔️",
+    ("राजा", "रानी", "सम्राट", "बादशाह", "शाही", "ताज", "king", "queen", "royal", "crown", "emperor", "raja", "rani", "badshah"): "👑",
+    ("खतरा", "सावधान", "ज़हर", "विष", "वार्निंग", "danger", "warning", "toxic", "poison", "alert", "khatra", "zahar"): "⚠️",
+    ("सांप", "नाग", "सर्प", "snake", "cobra", "saamp", "naag"): "🐍",
+    ("रात", "अंधेरा", "छाया", "चांद", "night", "dark", "shadow", "moon", "raat", "andhera"): "🌙",
+    ("आंख", "आंखें", "नज़र", "देखना", "eye", "eyes", "watch", "look", "see", "aankh", "nazar"): "👁️",
+    ("इतिहास", "प्राचीन", "पुराना", "सदियों", "समय", "काल", "history", "ancient", "old", "century", "time", "itihas", "prachin", "purana"): "⏳",
+    ("दरवाजा", "गुफा", "सुरंग", "द्वार", "gate", "door", "tunnel", "cave", "darwaza", "gufa", "surang"): "🚪",
+    ("सूरज", "रोशनी", "तारा", "चमक", "प्रकाश", "sun", "light", "star", "glow", "suraj", "roshni"): "☀️",
+    ("दिल", "खून", "रक्त", "प्यार", "heart", "blood", "love", "dil", "khoon"): "🩸",
+    ("आवाज़", "चीख", "शोर", "ध्वनि", "voice", "scream", "sound", "noise", "aawaaz", "cheokh"): "🗣️",
+}
+
+
+def get_context_emoji_for_text(text):
+    """Analyzes exact spoken phrase/words and returns matching topic emoji, else None."""
+    if not text:
+        return None
+    text_lower = text.lower()
+    for keyword_tuple, emoji in CONTEXT_EMOJI_MAP.items():
+        for kw in keyword_tuple:
+            if kw in text_lower:
+                return emoji
+    return None
+
+
+def find_emoji_font():
+    """Finds Segoe UI Emoji font on Windows for crisp emoji rendering."""
+    emoji_fonts = [
+        "C:/Windows/Fonts/seguiemj.ttf",
+        "C:/Windows/Fonts/Segoe UI Emoji.ttf",
+    ]
+    for font in emoji_fonts:
+        if os.path.exists(font):
+            return font
+    return None
+
+
+def render_caption_frame(chunk_words, active_word_index, emoji=None, width=1080, height=1920):
+    """Renders Hormozi/TikTok kinetic caption with scale-bounce active word & dynamic floating emoji badge."""
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    font_path = find_font()
+    emoji_font_path = find_emoji_font()
+    
+    font_main = ImageFont.truetype(font_path, 66)
+    font_active = ImageFont.truetype(font_path, 80) # +14px kinetic scale bounce
+
+    if emoji_font_path:
+        font_emoji = ImageFont.truetype(emoji_font_path, 60)
+    else:
+        font_emoji = font_main
+
+    center_x = width // 2
+    center_y = int(height * 0.76)
+    
+    word_boxes = []
+    total_w = 0
+    space_w = 22
+    
+    for i, w_info in enumerate(chunk_words):
+        is_active = (i == active_word_index)
+        f = font_active if is_active else font_main
+        bbox = draw.textbbox((0, 0), w_info['word'], font=f)
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        word_boxes.append({'word': w_info['word'], 'width': w, 'height': h, 'font': f, 'active': is_active})
+        total_w += w + space_w
+    total_w -= space_w
+    
+    start_x = center_x - (total_w // 2)
+    current_x = start_x
+    
+    # Outer dark rounded pill container for 100% legibility over any background
+    pad_x, pad_y = 35, 22
+    max_h = max([wb['height'] for wb in word_boxes]) if word_boxes else 65
+    badge_rect = [
+        start_x - pad_x,
+        center_y - pad_y,
+        start_x + total_w + pad_x,
+        center_y + max_h + pad_y + 12
+    ]
+    draw.rounded_rectangle(badge_rect, radius=30, fill=(0, 0, 0, 205), outline=(255, 255, 255, 140), width=3)
+    
+    # Floating Context Emoji Badge (if spoken phrase matches a topic concept)
+    if emoji:
+        e_bbox = draw.textbbox((0, 0), emoji, font=font_emoji)
+        e_w = e_bbox[2] - e_bbox[0]
+        e_h = e_bbox[3] - e_bbox[1]
+        e_center_x = center_x
+        e_center_y = center_y - 75
+        e_pad = 14
+        e_badge_rect = [
+            e_center_x - (e_w // 2) - e_pad,
+            e_center_y - (e_h // 2) - e_pad,
+            e_center_x + (e_w // 2) + e_pad,
+            e_center_y + (e_h // 2) + e_pad
+        ]
+        draw.rounded_rectangle(e_badge_rect, radius=20, fill=(20, 20, 30, 230), outline=(255, 230, 0, 220), width=3)
+        try:
+            draw.text((e_center_x - (e_w // 2), e_center_y - (e_h // 2) - 4), emoji, font=font_emoji, embedded_color=True)
+        except Exception:
+            draw.text((e_center_x - (e_w // 2), e_center_y - (e_h // 2) - 4), emoji, font=font_emoji, fill=(255, 255, 255, 255))
+
+    # Render Words
+    for wb in word_boxes:
+        word = wb['word']
+        f = wb['font']
+        is_act = wb['active']
+        
+        # 3D Depth Shadow offset layers
+        for offset in [(5, 5), (4, 4), (3, 3), (2, 2)]:
+            draw.text((current_x + offset[0], center_y + offset[1]), word, font=f, fill=(0, 0, 0, 255), stroke_width=5, stroke_fill=(0, 0, 0, 255))
+            
+        if is_act:
+            # Active word - Glowing Neon Yellow background pill & Scale Bounce
+            act_pad_x, act_pad_y = 16, 8
+            act_rect = [current_x - act_pad_x, center_y - act_pad_y, current_x + wb['width'] + act_pad_x, center_y + wb['height'] + act_pad_y + 4]
+            draw.rounded_rectangle(act_rect, radius=20, fill=(255, 230, 0, 250), outline=(255, 255, 255, 255), width=3)
+            # Active text in deep black for high contrast inside yellow pill
+            draw.text((current_x, center_y - 4), word, font=f, fill=(0, 0, 0, 255), stroke_width=2, stroke_fill=(255, 255, 255, 240))
+        else:
+            # Non-active word - Bright White with thick dark stroke
+            draw.text((current_x, center_y), word, font=f, fill=(255, 255, 255, 255), stroke_width=7, stroke_fill=(0, 0, 0, 255))
+            
+        current_x += wb['width'] + space_w
+        
+    return np.array(img)
+
+
+def create_mrbeast_caption_clip(audio_path, narration_text, duration):
+    """Creates a transparent VideoClip with kinetic subtitles & context emojis synced to Whisper timestamps."""
+    words = get_whisper_word_timestamps(audio_path, narration_text)
+    if not words:
+        return None
+        
+    # Group words into 3-word kinetic display chunks
+    chunks = []
+    chunk_size = 3
+    for i in range(0, len(words), chunk_size):
+        group = words[i:i+chunk_size]
+        start_t = group[0]['start']
+        end_t = group[-1]['end']
+        
+        # Analyze exact phrase spoken in this chunk for dynamic context emoji matching
+        chunk_text = " ".join([w['word'] for w in group])
+        chunk_emoji = get_context_emoji_for_text(chunk_text)
+        if not chunk_emoji and narration_text:
+            chunk_emoji = get_context_emoji_for_text(narration_text)
+            
+        chunks.append({
+            'words': group,
+            'start': start_t,
+            'end': end_t,
+            'emoji': chunk_emoji
+        })
+        
+    def make_frame(t):
+        active_chunk = None
+        for ch in chunks:
+            if ch['start'] <= t <= ch['end'] + 0.3:
+                active_chunk = ch
+                break
+        if not active_chunk and chunks:
+            active_chunk = min(chunks, key=lambda c: abs(c['start'] - t))
+            if abs(active_chunk['start'] - t) > 1.0:
+                active_chunk = None
+                
+        if not active_chunk:
+            return np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 4), dtype=np.uint8)
+            
+        active_idx = -1
+        for idx, w in enumerate(active_chunk['words']):
+            if w['start'] <= t <= w['end']:
+                active_idx = idx
+                break
+        if active_idx == -1:
+            active_idx = 0
+            
+        return render_caption_frame(active_chunk['words'], active_idx, emoji=active_chunk.get('emoji'), width=VIDEO_WIDTH, height=VIDEO_HEIGHT)
+        
+    try:
+        caption_clip = VideoClip(make_frame, duration=duration)
+        return caption_clip
+    except Exception as e:
+        print(f"⚠️ Caption clip creation failed: {e}")
+        return None
+
+
+# ============================================================
 # BUILD SCENE
 # ============================================================
 
@@ -2485,8 +2777,7 @@ def build_scene(
 ):
 
     print(
-        f"\n🎬 Building scene "
-        f"{scene_number}"
+        f"\n🎬 Building scene {scene_number} with MrBeast Captions & Anti-Reused FX"
     )
 
     narration_audio = None
@@ -2577,7 +2868,15 @@ def build_scene(
             )
 
         # ----------------------------------------------------
-        # SFX
+        # Anti-Reused Content: Dynamic Ken Burns Zoom Transformation
+        # ----------------------------------------------------
+        try:
+            video = video.resized(lambda t: 1.0 + 0.04 * (t / max(duration, 0.1)))
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # SFX Layer
         # ----------------------------------------------------
 
         audio_layers = [
@@ -2612,8 +2911,17 @@ def build_scene(
             )
         )
 
+        # ----------------------------------------------------
+        # MrBeast 3D Dynamic Animated Captions Overlay
+        # ----------------------------------------------------
+        caption_clip = create_mrbeast_caption_clip(audio_path, narration, duration)
+        
+        video_layers = [video]
+        if caption_clip is not None:
+            video_layers.append(caption_clip)
+
         final_scene = CompositeVideoClip(
-            [video],
+            video_layers,
             size=(
                 VIDEO_WIDTH,
                 VIDEO_HEIGHT,
@@ -2723,24 +3031,48 @@ def add_background_music(
 # THUMBNAIL
 # ============================================================
 
-def find_font():
+FONT_CACHE_DIR = Path("fonts")
+FONT_CACHE_DIR.mkdir(exist_ok=True)
+LOCAL_NOTO_FONT = FONT_CACHE_DIR / "NotoSansDevanagari-Bold.ttf"
 
+def download_devanagari_font():
+    """Downloads NotoSansDevanagari-Bold.ttf as a guaranteed Devanagari fallback font if system font is unavailable."""
+    if LOCAL_NOTO_FONT.exists() and LOCAL_NOTO_FONT.stat().st_size > 10000:
+        return str(LOCAL_NOTO_FONT.resolve())
+    try:
+        url = "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Bold.ttf"
+        print("⏬ Downloading Devanagari font (NotoSansDevanagari-Bold.ttf)...")
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200 and len(r.content) > 10000:
+            with open(LOCAL_NOTO_FONT, "wb") as f:
+                f.write(r.content)
+            print("✅ Devanagari font downloaded successfully.")
+            return str(LOCAL_NOTO_FONT.resolve())
+    except Exception as e:
+        print(f"⚠️ Font download exception: {e}")
+    return None
+
+def find_font():
+    """Finds a valid TrueType Devanagari font for Hindi caption rendering. Never returns load_default bitmap font."""
     fonts = [
-        "C:/Windows/Fonts/NirmalaB.ttf",
-        "C:/Windows/Fonts/mangal.ttf",
-        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/Nirmala.ttf",        # Nirmala UI Regular
+        "C:/Windows/Fonts/NirmalaB.ttf",       # Nirmala UI Bold
+        "C:/Windows/Fonts/mangal.ttf",         # Mangal
+        "C:/Windows/Fonts/aparaj.ttf",        # Aparajita
+        str(LOCAL_NOTO_FONT.resolve()),
         "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Bold.ttf",
-        "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     ]
+    for font_path in fonts:
+        if os.path.exists(font_path) and os.path.getsize(font_path) > 10000:
+            return font_path
 
-    for font in fonts:
+    # Auto-download NotoSansDevanagari if no local font matched
+    downloaded_font = download_devanagari_font()
+    if downloaded_font:
+        return downloaded_font
 
-        if os.path.exists(font):
-            return font
-
-    return None
+    raise RuntimeError("❌ No Devanagari font found on system and auto-download failed. Please ensure Nirmala.ttf or NotoSansDevanagari font is installed.")
 
 
 def create_thumbnail(
@@ -2789,17 +3121,10 @@ def create_thumbnail(
         )
 
         font_path = find_font()
-
-        if font_path:
-
-            font = ImageFont.truetype(
-                font_path,
-                72,
-            )
-
-        else:
-
-            font = ImageFont.load_default()
+        font = ImageFont.truetype(
+            font_path,
+            72,
+        )
 
         words = str(
             title
