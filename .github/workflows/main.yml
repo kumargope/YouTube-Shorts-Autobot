@@ -5,12 +5,10 @@ on:
     # ==========================================================
     # INDIA TIME (IST = UTC+5:30)
     #
-    # 12:00 PM IST = 06:30 UTC
-    # 06:00 PM IST = 12:30 UTC
+    # 01:20 PM IST = 07:50 UTC
     # ==========================================================
 
-    - cron: '30 6 * * *'     # 12:00 PM IST
-    - cron: '30 12 * * *'    # 06:00 PM IST
+    - cron: '50 7 * * *'     # 01:20 PM IST
 
   # Manual run from GitHub Actions
   workflow_dispatch:
@@ -122,6 +120,7 @@ jobs:
           echo "=============================================="
 
           echo "🇮🇳 Timezone: Asia/Kolkata"
+          echo "⏰ Scheduled Time: 01:20 PM IST"
           echo "🎬 Generating mystery short..."
           echo "🎙️ Generating Hindi male voice..."
           echo "🎥 Downloading Pexels footage..."
@@ -169,7 +168,6 @@ jobs:
           echo "=============================================="
 
           echo "📅 Schedule:"
-          echo "   12:00 PM IST"
-          echo "   06:00 PM IST"
+          echo "   01:20 PM IST"
 
-          echo "🎬 Next automatic run will be according to schedule."
+          echo "🎬 Next automatic run: 01:20 PM IST"
