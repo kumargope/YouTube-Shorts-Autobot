@@ -3,27 +3,31 @@ name: Automatic Shorts Publisher 24/7
 on:
   schedule:
     # ==========================================================
-    # INDIA TIME (IST = UTC+5:30)
-    #
-    # 01:20 PM IST = 07:50 UTC
+    # DAILY SCHEDULE
+    # 01:20 PM IST
     # ==========================================================
+    - cron: '20 13 * * *'
+      timezone: 'Asia/Kolkata'
 
-    - cron: '50 7 * * *'     # 01:20 PM IST
-
-  # Manual run from GitHub Actions
+  # ==========================================================
+  # MANUAL RUN
+  # GitHub Actions → Run workflow
+  # ==========================================================
   workflow_dispatch:
 
+# ============================================================
+# PREVENT MULTIPLE VIDEO GENERATION JOBS RUNNING TOGETHER
+# ============================================================
+concurrency:
+  group: automatic-shorts-publisher
+  cancel-in-progress: false
+
 jobs:
+
   build_and_upload:
 
     runs-on: ubuntu-latest
 
-    # Give enough time for:
-    # AI script generation
-    # Pexels video downloads
-    # Voice generation
-    # Video rendering
-    # YouTube upload
     timeout-minutes: 30
 
     permissions:
@@ -31,36 +35,110 @@ jobs:
 
     steps:
 
-      # ========================================================
+      # ======================================================
       # 1. CHECKOUT
-      # ========================================================
+      # ======================================================
 
       - name: Checkout Code
-
         uses: actions/checkout@v4
-
         with:
           persist-credentials: true
 
-
-      # ========================================================
+      # ======================================================
       # 2. SETUP PYTHON
-      # ========================================================
+      # ======================================================
 
       - name: Setup Python
-
         uses: actions/setup-python@v5
-
         with:
           python-version: '3.10'
 
+      # ======================================================
+      # 3. CHECK SCHEDULE / DELAY
+      # ======================================================
 
-      # ========================================================
-      # 3. SYSTEM DEPENDENCIES
-      # ========================================================
+      - name: Check Schedule and Detect Delay
+        shell: bash
+        run: |
+
+          echo "================================================"
+          echo "⏰ SCHEDULE / DELAY CHECK"
+          echo "================================================"
+
+          echo "GitHub event: ${{ github.event_name }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Workflow: ${{ github.workflow }}"
+
+          echo ""
+          echo "Runner UTC time:"
+          date -u '+%Y-%m-%d %H:%M:%S UTC'
+
+          echo ""
+          echo "Runner IST time:"
+          TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST'
+
+          # --------------------------------------------------
+          # Scheduled target time:
+          # Every day at 13:20 Asia/Kolkata
+          # --------------------------------------------------
+
+          python - <<'PY'
+          from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
+
+          now_utc = datetime.now(timezone.utc)
+          now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
+          print("Current UTC :", now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"))
+          print("Current IST :", now_ist.strftime("%Y-%m-%d %H:%M:%S IST"))
+
+          if "${{ github.event_name }}" == "schedule":
+
+              scheduled = now_ist.replace(
+                  hour=13,
+                  minute=20,
+                  second=0,
+                  microsecond=0
+              )
+
+              delay_seconds = (now_ist - scheduled).total_seconds()
+
+              # If workflow somehow starts before 13:20,
+              # treat it as zero delay for logging.
+              delay_minutes = max(0, delay_seconds / 60)
+
+              print("")
+              print("Expected scheduled time:")
+              print(
+                  scheduled.strftime("%Y-%m-%d %H:%M:%S IST")
+              )
+
+              print("")
+              print(f"Detected delay: {delay_minutes:.2f} minutes")
+
+              if delay_minutes <= 5:
+                  print("🟢 STATUS: ON TIME / SMALL DELAY")
+
+              elif delay_minutes <= 30:
+                  print("🟡 STATUS: MODERATE DELAY")
+
+              else:
+                  print("🔴 STATUS: LARGE DELAY")
+
+          else:
+              print("")
+              print("🟢 MANUAL RUN")
+              print("Delay detection skipped because this run was manual.")
+
+          print("")
+          print("================================================")
+          PY
+
+      # ======================================================
+      # 4. SYSTEM DEPENDENCIES
+      # ======================================================
 
       - name: Install System Dependencies
-
         run: |
 
           sudo apt-get update
@@ -75,13 +153,11 @@ jobs:
             's/policy domain="path" rights="none" pattern="@\*"/policy domain="path" rights="read|write" pattern="@\*"/g' \
             /etc/ImageMagick-6/policy.xml
 
-
-      # ========================================================
-      # 4. INSTALL PYTHON PACKAGES
-      # ========================================================
+      # ======================================================
+      # 5. INSTALL PYTHON PACKAGES
+      # ======================================================
 
       - name: Install Python Packages
-
         run: |
 
           python -m pip install --upgrade pip
@@ -98,46 +174,50 @@ jobs:
             google-auth-oauthlib \
             google-auth-httplib2
 
-
-      # ========================================================
-      # 5. RUN VIDEO GENERATOR + YOUTUBE UPLOADER
-      # ========================================================
+      # ======================================================
+      # 6. GENERATE + UPLOAD SHORT
+      # ======================================================
 
       - name: Generate and Upload Short
-
         env:
 
           # Groq AI
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
 
-          # Pexels stock video API
+          # Pexels
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
 
         run: |
 
-          echo "=============================================="
+          echo "================================================"
           echo "🚀 AUTOMATIC YOUTUBE SHORTS SYSTEM"
-          echo "=============================================="
+          echo "================================================"
 
           echo "🇮🇳 Timezone: Asia/Kolkata"
-          echo "⏰ Scheduled Time: 01:20 PM IST"
+          echo "⏰ Target Time: 01:20 PM IST"
+
+          echo ""
+          echo "Current time:"
+          TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST'
+
+          echo ""
           echo "🎬 Generating mystery short..."
           echo "🎙️ Generating Hindi male voice..."
           echo "🎥 Downloading Pexels footage..."
           echo "🎞️ Rendering video..."
           echo "📤 Uploading to YouTube..."
 
+          echo ""
+          echo "================================================"
+
           python yt_animation_test.py
 
-
-      # ========================================================
-      # 6. SAVE HISTORY + YOUTUBE TOKEN
-      # ========================================================
+      # ======================================================
+      # 7. SAVE HISTORY + YOUTUBE TOKEN
+      # ======================================================
 
       - name: Save History to Repository
-
         if: always()
-
         run: |
 
           git config --global user.name "github-actions[bot]"
@@ -145,29 +225,62 @@ jobs:
           git config --global user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
+          echo "Checking files to save..."
+
           git add used_topics.txt token.json || true
 
-          git diff --cached --quiet || \
-            git commit -m "Auto-update history and YouTube token [skip ci]"
+          if git diff --cached --quiet; then
 
-          git push || true
+            echo "ℹ️ No changes to commit."
 
+          else
 
-      # ========================================================
-      # 7. FINISH
-      # ========================================================
+            git commit \
+              -m "Auto-update history and YouTube token [skip ci]"
+
+            git push || true
+
+          fi
+
+      # ======================================================
+      # 8. FINAL STATUS / TIME LOG
+      # ======================================================
 
       - name: Job Complete
-
         if: always()
-
+        shell: bash
         run: |
 
-          echo "=============================================="
+          echo ""
+          echo "================================================"
+          echo "📊 AUTOMATION JOB SUMMARY"
+          echo "================================================"
+
+          echo "Workflow event: ${{ github.event_name }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run number: ${{ github.run_number }}"
+
+          echo ""
+          echo "Target schedule:"
+          echo "   🇮🇳 01:20 PM IST"
+
+          echo ""
+          echo "Final UTC time:"
+          date -u '+%Y-%m-%d %H:%M:%S UTC'
+
+          echo ""
+          echo "Final IST time:"
+          TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M:%S IST'
+
+          echo ""
+          echo "Repository:"
+          echo "${{ github.repository }}"
+
+          echo ""
+          echo "Job status:"
+          echo "${{ job.status }}"
+
+          echo ""
+          echo "================================================"
           echo "✅ AUTOMATION JOB FINISHED"
-          echo "=============================================="
-
-          echo "📅 Schedule:"
-          echo "   01:20 PM IST"
-
-          echo "🎬 Next automatic run: 01:20 PM IST"
+          echo "================================================"
