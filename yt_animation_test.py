@@ -1,1370 +1,4835 @@
 import os
 import sys
-import re
 import json
-import math
 import random
 import asyncio
-import logging
-import datetime
-import subprocess
-import importlib
+import math
+import time
+import re
 from pathlib import Path
 
-# Force UTF-8 on Windows Console to avoid charmap UnicodeEncodeError with Hindi text
+# Ensure UTF-8 stdout on Windows to support emojis and Devanagari text in console logs
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
-# Third-party libraries
-from dotenv import load_dotenv
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from dotenv import load_dotenv
+from groq import Groq
 import edge_tts
 
-# ==============================================================================
-# 1. CONFIGURATION & DIRECTORIES
-# ==============================================================================
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+import numpy as np
+from moviepy import (
+    VideoClip,
+    VideoFileClip,
+    AudioFileClip,
+    CompositeAudioClip,
+    CompositeVideoClip,
+    concatenate_videoclips,
+    concatenate_audioclips,
+)
+import moviepy.video.fx as vfx
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-YOUTUBE_CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET", str(BASE_DIR / "credentials" / "client_secret.json"))
-YOUTUBE_TOKEN_FILE = os.getenv("YOUTUBE_TOKEN_FILE", str(BASE_DIR / "credentials" / "token.json"))
-YOUTUBE_PRIVACY_STATUS = os.getenv("YOUTUBE_PRIVACY_STATUS", "private")
-
-VIDEO_WIDTH = int(os.getenv("VIDEO_WIDTH", "1080"))
-VIDEO_HEIGHT = int(os.getenv("VIDEO_HEIGHT", "1920"))
-FPS = int(os.getenv("FPS", "30"))
-
-DEFAULT_VOICE = os.getenv("VOICE", "hi-IN-MadhurNeural")
-TTS_SPEED = "+0%"
-TTS_PITCH = "+0Hz"
-
-DATA_DIR = BASE_DIR / "data"
-USED_TOPICS_FILE = DATA_DIR / "used_topics.json"
-GENERATED_VIDEOS_FILE = DATA_DIR / "generated_videos.json"
-
-OUTPUT_DIR = BASE_DIR / "output"
-VIDEOS_DIR = OUTPUT_DIR / "videos"
-THUMBNAILS_DIR = OUTPUT_DIR / "thumbnails"
-METADATA_DIR = OUTPUT_DIR / "metadata"
-TEMP_DIR = OUTPUT_DIR / "temp"
-
-CREDENTIALS_DIR = BASE_DIR / "credentials"
-LOGS_DIR = BASE_DIR / "logs"
-LOG_FILE = LOGS_DIR / "app.log"
-
-for d in [DATA_DIR, OUTPUT_DIR, VIDEOS_DIR, THUMBNAILS_DIR, METADATA_DIR, TEMP_DIR, CREDENTIALS_DIR, LOGS_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 
 
-# ==============================================================================
-# 2. LOGGING SETUP
-# ==============================================================================
-class ConsoleFormatter(logging.Formatter):
-    def format(self, record):
-        levelname = record.levelname
-        msg = record.getMessage().encode("ascii", "replace").decode("ascii")
-        if levelname == "INFO":
-            return f"[INFO] {msg}"
-        elif levelname == "WARNING":
-            return f"[WARNING] {msg}"
-        elif levelname == "ERROR":
-            return f"[ERROR] {msg}"
-        elif levelname == "CRITICAL":
-            return f"[CRITICAL] {msg}"
-        return f"[{levelname}] {msg}"
+# ============================================================
+# CONFIG
+# ============================================================
 
-def setup_logger():
-    logger_instance = logging.getLogger("FactVideoGenerator")
-    logger_instance.setLevel(logging.DEBUG)
-    if logger_instance.handlers:
-        return logger_instance
+load_dotenv()
 
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(ConsoleFormatter())
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
+ELEVENLABS_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter("%(asctime)s - [%(levelname)s] - %(message)s"))
+if not GROQ_KEY:
+    raise ValueError("GROQ_API_KEY missing.")
 
-    logger_instance.addHandler(ch)
-    logger_instance.addHandler(fh)
-    return logger_instance
+if not PEXELS_API_KEY:
+    raise ValueError("PEXELS_API_KEY missing.")
 
-logger = setup_logger()
+groq_client = Groq(api_key=GROQ_KEY)
+
+OUTPUT_DIR = Path("output")
+CLIPS_DIR = OUTPUT_DIR / "clips"
+AUDIO_DIR = OUTPUT_DIR / "audio"
+THUMBNAIL_DIR = OUTPUT_DIR / "thumbnails"
+SFX_DIR = Path("sfx")
+
+for folder in (
+    OUTPUT_DIR,
+    CLIPS_DIR,
+    AUDIO_DIR,
+    THUMBNAIL_DIR,
+    SFX_DIR,
+):
+    folder.mkdir(parents=True, exist_ok=True)
+
+BGM_FILE = Path("bgm.mp3")
+
+WHOOSH_FILE = SFX_DIR / "whoosh.mp3"
+IMPACT_FILE = SFX_DIR / "impact.mp3"
+HEARTBEAT_FILE = SFX_DIR / "heartbeat.mp3"
+HIT_FILE = SFX_DIR / "hit.mp3"
+
+TOKEN_FILE = Path("token.json")
+CLIENT_SECRET_FILE = Path("client_secret.json")
+
+USED_TOPICS_FILE = Path("used_topics.json")
+
+VIDEO_WIDTH = 1080
+VIDEO_HEIGHT = 1920
+FPS = 30
+
+VOICE = "hi-IN-MadhurNeural"
+VOICE_RATE = "+16%"
+VOICE_PITCH = "-2Hz"
+
+YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+
+MAX_SHORT_DURATION = 35.0
+
+YOUTUBE_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+YOUTUBE_UPLOAD_MAX_RETRIES = 6
+
+GITHUB_TOKEN_SECRET_NAMES = (
+    "YOUTUBE_TOKEN_JSON",
+    "TOKEN_JSON",
+)
+
+# ------------------------------------------------------------
+# RETRY SETTINGS
+# ------------------------------------------------------------
+
+# पूरे video को दोबारा generate करने की maximum कोशिश।
+MAX_FULL_VIDEO_ATTEMPTS = 4
+
+# हर scene के लिए Pexels queries की maximum संख्या।
+MAX_PEXELS_QUERY_ATTEMPTS = 8
+
+# SFX volume.
+# पहले 0.28 था।
+# अब काफी stronger रखा गया है।
+SFX_BASE_VOLUME = 0.72
+
+# BGM voice/SFX को दबाए नहीं।
+BGM_VOLUME = 0.24
+
+# SFX को scene में maximum कितनी देर तक रखें।
+MAX_SFX_DURATION = 1.25
 
 
-# ==============================================================================
-# 3. CATEGORIES & TOPIC GENERATOR
-# ==============================================================================
-CATEGORIES = [
-    "ANIMALS", "BIRDS", "PLANTS", "TREES", "HUMANS", "HUMAN BODY",
-    "INSECTS", "MARINE LIFE", "REPTILES", "AMPHIBIANS", "NATURE",
-    "SCIENCE", "SPACE", "EARTH", "WEATHER", "ENVIRONMENT", "EVOLUTION",
-    "HISTORICAL/NATURAL FACTS", "RARE & UNUSUAL FACTS"
+# ============================================================
+# INDIA-ONLY MYSTERY TOPICS
+# ============================================================
+
+MYSTERY_TOPICS = [
+    "Bhangarh Fort Rajasthan mystery",
+    "Kuldhara abandoned village Rajasthan mystery",
+    "Roopkund skeleton lake Uttarakhand mystery",
+    "Konark Sun Temple Odisha mystery",
+    "Meenakshi Temple Madurai hidden history",
+    "Ellora Caves Maharashtra unexplained mystery",
+    "Ajanta Caves Maharashtra hidden history",
+    "Golconda Fort Hyderabad secret tunnels",
+    "Daulatabad Fort Maharashtra secret history",
+    "Lepakshi Temple Andhra Pradesh mystery",
+    "Padmanabhaswamy Temple Kerala hidden history",
+    "Jagannath Temple Puri unexplained mystery",
+    "Brihadeeswarar Temple Tamil Nadu mystery",
+    "Rani ki Vav Gujarat hidden history",
+    "Lothal Gujarat ancient civilization mystery",
+    "Dholavira Gujarat ancient city mystery",
+    "Mohenjo-daro Indian civilization mystery",
+    "Nalanda Bihar ancient university mystery",
+    "Vikramshila Bihar ancient university mystery",
+    "Sanchi Stupa Madhya Pradesh hidden history",
+    "Khajuraho Madhya Pradesh hidden history",
+    "Hampi Karnataka lost city mystery",
+    "Vijayanagara Empire mystery",
+    "Shani Shingnapur Maharashtra mystery",
+    "Shiv Temple India ancient architecture mystery",
+    "Kailasa Temple Ellora construction mystery",
+    "Iron Pillar Delhi rust mystery",
+    "Delhi Sultanate forgotten history",
+    "Red Fort Delhi hidden history",
+    "Qutub Minar Delhi hidden history",
+    "Agrasen ki Baoli Delhi mystery",
+    "Jaisalmer Fort Rajasthan hidden history",
+    "Kumbhalgarh Fort Rajasthan secret history",
+    "Mehrangarh Fort Rajasthan mystery",
+    "Chittorgarh Fort Rajasthan hidden history",
+    "Amer Fort Jaipur secret passage mystery",
+    "Bhangarh village folklore mystery",
+    "Indian freedom movement unsolved mystery",
+    "Subhas Chandra Bose historical mystery",
+    "Lal Bahadur Shastri historical mystery",
+    "Indian ancient manuscript mystery",
+    "Indian archaeological discovery mystery",
+    "Indian temple underground tunnel mystery",
+    "Indian lost city historical mystery",
+    "Indian shipwreck historical mystery",
+    "Indian haunted fort folklore mystery",
+    "Indian cave civilization mystery",
+    "Indian ancient engineering mystery",
+    "Indian astronomy ancient history mystery",
+    "Indian stepwell hidden history",
+    "Indian railway historical mystery",
+    "Indian historical artifact mystery",
 ]
 
-SEED_FACT_TOPICS = {
-    "ANIMALS": [
-        "हाथी अपनी सूंड का इस्तेमाल इतनी सारी चीज़ों के लिए कैसे करते हैं?",
-        "चीता 100 किलोमीटर प्रति घंटे से भी ज़्यादा तेज़ कैसे दौड़ लेता है?",
-        "रात में भेड़िये चाँद की तरफ देखकर क्यों चिल्लाते हैं?",
-        "चमगादड़ घने अंधेरे में भी बिना टकराए कैसे उड़ लेते हैं?",
-        "स्लॉथ दुनिया का सबसे सुस्त जानवर क्यों माना जाता है?",
-        "कंगारू अपनी पूँछ का इस्तेमाल तीसरे पैर की तरह कैसे करते हैं?"
-    ],
-    "BIRDS": [
-        "उल्लू अपनी गर्दन 270 डिग्री तक कैसे घुमा लेता है?",
-        "फ्लेमिंगो पक्षी हमेशा एक पैर पर खड़े होकर क्यों सोते हैं?",
-        "हमिंगबर्ड पीछे की तरफ और हवा में एक ही जगह कैसे उड़ सकती है?",
-        "प्रवासी पक्षी हज़ारों किलोमीटर का रास्ता बिना भटके कैसे तय करते हैं?",
-        "कटफोड़वा पेड़ पर लगातार चोंच मारकर भी घायल क्यों नहीं होता?",
-        "पेंगुइन बर्फ की कड़ाके की ठंड में भी खुद को गर्म कैसे रखते हैं?"
-    ],
-    "PLANTS": [
-        "पेड़-पौधों को कैसे पता चलता है कि सूरज की रोशनी कहाँ है?",
-        "वीनस फ्लाईट्रैप कीड़े-मकोड़ों को पलक झपकते कैसे पकड़ लेता है?",
-        "सूरजमुखी का फूल हमेशा सूरज की दिशा में ही क्यों मुड़ता है?",
-        "कैक्टस बिना पानी के रेगिस्तान में महीनों तक कैसे ज़िंदा रहता है?",
-        "कुछ अनोखे फूल सिर्फ रात में ही क्यों खिलते हैं?",
-        "पौधे भूखे कीड़ों से बचने के लिए खुद की रक्षा कैसे करते हैं?"
-    ],
-    "TREES": [
-        "पेड़ ज़मीन के नीचे अपनी जड़ों से आपस में बातें कैसे करते हैं?",
-        "पतझड़ के मौसम में पेड़ों की पत्तियां रंग क्यों बदल लेती हैं?",
-        "विशाल सिकोइया पेड़ सैकड़ों फीट ऊपर तक पानी कैसे पहुँचाते हैं?",
-        "सर्दियों में पेड़ अपनी पत्तियां क्यों गिरा देते हैं?",
-        "पेड़ अपनी छाल कटने के बाद खुद को कैसे ठीक करते हैं?",
-        "पुराने पेड़ नए पौधों को पोषक तत्व कैसे भेजते हैं?"
-    ],
-    "HUMANS": [
-        "इंसान रोते समय आंसू क्यों बहाते हैं और इसके पीछे का विज्ञान क्या है?",
-        "इंसानी दिमाग किसी भी सुपरकंप्यूटर से लाखों गुना तेज़ कैसे काम करता है?",
-        "इंसान हँसते क्यों हैं और हँसी हमारे शरीर पर क्या चमत्कारी असर डालती है?",
-        "इंसान के फिंगरप्रिंट दुनिया में किसी भी दूसरे व्यक्ति से कभी क्यों नहीं मिलते?",
-        "प्राचीन काल में इंसानों ने पहिए और आग की खोज कैसे की थी?"
-    ],
-    "HUMAN BODY": [
-        "इंसानी दिल बिना एक पल रुके पूरी ज़िंदगी कैसे धड़कता रहता है?",
-        "ठंड या डर लगने पर हमारे रोंगटे क्यों खड़े हो जाते हैं?",
-        "सोते समय हमारे दिमाग में सपने क्यों आते हैं?",
-        "हमें अचानक हिचकी क्यों आने लगती है?",
-        "इंसानी आँखें अंधेरे और उजाले में तुरंत एडजस्ट कैसे होती हैं?",
-        "हमारा इम्यून सिस्टम सालों पुराने वायरस को भी कैसे याद रखता है?"
-    ],
-    "INSECTS": [
-        "चींटियाँ अपने वजन से 50 गुना ज़्यादा भार कैसे उठा लेती हैं?",
-        "मधुमक्खियाँ आपस में डांस करके फूलों का रास्ता कैसे बताती हैं?",
-        "जुगनू बिना किसी आग या गर्मी के अपने शरीर से रोशनी कैसे निकालते हैं?",
-        "मच्छर अंधेरे कमरे में भी इंसान को उसकी सांसों से कैसे ढूंढ लेते हैं?",
-        "तिलचट्टा बिना सिर के भी कई हफ़्तों तक ज़िंदा कैसे रह सकता है?"
-    ],
-    "REPTILES": [
-        "गिरगिट अपने शरीर का रंग मिनटों में कैसे और क्यों बदल लेता है?",
-        "मगरमच्छ पानी के अंदर घंटों तक बिना सांस लिए कैसे छिपे रहते हैं?",
-        "सांप अपनी जीभ बार-बार बाहर निकालकर हवा को कैसे सूंघते हैं?",
-        "कोमोडो ड्रैगन के काटने से शिकार कुछ ही घंटों में क्यों मर जाता है?",
-        "छिपकली अपनी कटी हुई पूँछ को दोबारा कैसे उगा लेती है?"
-    ],
-    "MARINE LIFE": [
-        "ऑक्टोपस सिर्फ एक सेकंड में अपना रंग और रूप कैसे बदल लेता है?",
-        "व्हेल मछलियाँ हज़ारों मील दूर तक आपस में आवाज़ कैसे पहुँचाती हैं?",
-        "इलेक्ट्रिक ईल 600 वोल्ट तक का करंट कैसे पैदा करती है?",
-        "गहरे समुद्र के जीव पानी के भारी दबाव में भी कैसे ज़िंदा रहते हैं?",
-        "जेलिफ़िश समुद्र की गहराई में अंधेरे में भी क्यों चमकती हैं?",
-        "समुद्री कछुए उसी तट पर वापस कैसे पहुँचते हैं जहाँ उनका जन्म हुआ था?"
-    ],
-    "SPACE": [
-        "अंतरिक्ष में पूरी तरह सन्नाटा क्यों होता है?",
-        "ब्लैक होल प्रकाश और समय को भी अपने अंदर कैसे खींच लेता है?",
-        "शुक्र ग्रह बुध से दूर होने के बावजूद सबसे गर्म क्यों है?",
-        "न्यूट्रॉन तारे एक सेकंड में सैकड़ों बार कैसे घूमते हैं?",
-        "चाँद हमेशा पृथ्वी को अपना एक ही चेहरा क्यों दिखाता है?",
-        "सौर तूफान पृथ्वी की बिजली और सैटेलाइट को कैसे प्रभावित करते हैं?"
-    ],
-    "SCIENCE": [
-        "पानी पर बर्फ तैरती क्यों है जबकि बाकी ठोस चीजें डूब जाती हैं?",
-        "बिजली की चमक सूरज की सतह से 5 गुना ज़्यादा गर्म कैसे होती है?",
-        "दिन में आसमान नीला और शाम को लाल क्यों दिखाई देता है?",
-        "चुंबक के चारों ओर अदृश्य चुंबकीय क्षेत्र कैसे बनता है?",
-        "पानी में ध्वनि हवा के मुकाबले ज़्यादा तेज़ क्यों चलती है?",
-        "शीशा या कांच पारदर्शी क्यों होता है?"
-    ],
-    "HISTORICAL/NATURAL FACTS": [
-        "भानगढ़ किले का खौफनाक रहस्य क्या है जहाँ शाम के बाद जाना मना है?",
-        "मिस्र के पिरामिडों को 4500 साल पहले बिना किसी क्रेन के कैसे बनाया गया था?",
-        "पद्मनाभस्वामी मंदिर के गुप्त 7वें तहखाने का रहस्य क्या है?",
-        "बरमूडा ट्रायंगल में आज तक दर्जनों जहाज़ और विमान कैसे गायब हो गए?",
-        "मेहरानगढ़ किले के नीचे दबे गुप्त खजाने की क्या कहानी है?"
-    ],
-    "RARE & UNUSUAL FACTS": [
-        "दुनिया में एक ऐसा रेगिस्तान भी है जहाँ पिछले 20 लाख सालों से बारिश नहीं हुई?",
-        "ऑक्टोपस और केकड़ों के खून का रंग लाल नहीं बल्कि नीला क्यों होता है?",
-        "पेड़ों की भी अपनी एक अंडरग्राउंड फंगल इंटरनेट प्रणाली होती है?",
-        "दुनिया की सबसे गहरी खाई मरियाना ट्रेंच में क्या रहस्य छिपे हैं?"
-    ]
-}
 
-def load_used_topics() -> list:
-    if USED_TOPICS_FILE.exists():
-        try:
-            with open(USED_TOPICS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception as e:
-            logger.warning(f"Could not load used topics: {e}")
-    return []
+# ============================================================
+# INDIA VALIDATION
+# ============================================================
 
-def save_used_topic(topic_entry: dict):
-    used = load_used_topics()
-    used.append(topic_entry)
-    with open(USED_TOPICS_FILE, "w", encoding="utf-8") as f:
-        json.dump(used, f, indent=2, ensure_ascii=False)
+FORBIDDEN_FOREIGN_TERMS = [
+    "bermuda",
+    "dyatlov",
+    "roanoke",
+    "mary celeste",
+    "tutankhamun",
+    "egypt",
+    "egyptian",
+    "nazca",
+    "antikythera",
+    "voynich",
+    "oak island",
+    "atlantis",
+    "stonehenge",
+    "jack the ripper",
+    "amelia earhart",
+    "d.b. cooper",
+    "pompeii",
+    "roman empire",
+    "viking",
+    "europe",
+    "america",
+    "new york",
+    "london",
+    "paris",
+    "japan",
+    "china",
+    "greece",
+    "mesopotamia",
+]
 
-def is_topic_used(topic_text: str, used_topics: list) -> bool:
-    norm_topic = re.sub(r'[^\w\s]', '', topic_text.lower()).strip()
-    for item in used_topics:
-        existing_topic = item.get("topic", "") if isinstance(item, dict) else str(item)
-        norm_existing = re.sub(r'[^\w\s]', '', existing_topic.lower()).strip()
-        if norm_topic == norm_existing or norm_topic in norm_existing or norm_existing in norm_topic:
-            return True
-    return False
+INDIA_TERMS = [
+    "india",
+    "indian",
+    "भारत",
+    "भारतीय",
+    "rajasthan",
+    "delhi",
+    "uttarakhand",
+    "odisha",
+    "karnataka",
+    "kerala",
+    "tamil nadu",
+    "tamil",
+    "andhra",
+    "telangana",
+    "maharashtra",
+    "gujarat",
+    "bihar",
+    "madhya pradesh",
+    "west bengal",
+    "punjab",
+    "assam",
+    "goa",
+    "hampi",
+    "varanasi",
+    "jaipur",
+    "agra",
+    "hyderabad",
+    "mumbai",
+    "kolkata",
+    "chennai",
+    "puri",
+    "konark",
+]
 
-def generate_topic(category: str = None, custom_topic: str = None) -> dict:
+
+def ensure_india_query(query):
+    query = str(query or "").strip()
+
+    if not query:
+        query = "Indian history"
+
+    lowered = query.lower()
+
+    if any(
+        term in lowered
+        for term in FORBIDDEN_FOREIGN_TERMS
+    ):
+        raise ValueError(
+            f"Non-Indian visual query rejected: {query}"
+        )
+
+    if not any(
+        term in lowered
+        for term in INDIA_TERMS
+    ):
+        query = f"India {query}"
+
+    return query
+
+
+# ============================================================
+# USED TOPIC TRACKING
+# ============================================================
+
+def normalize_topic(topic):
+    return " ".join(
+        str(topic or "").strip().lower().split()
+    )
+
+
+def load_used_topics():
+
+    if not USED_TOPICS_FILE.exists():
+        return set()
+
+    try:
+        with open(
+            USED_TOPICS_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+
+            data = json.load(file)
+
+        if isinstance(data, dict):
+            topics = data.get("topics", [])
+
+        elif isinstance(data, list):
+            topics = data
+
+        else:
+            topics = []
+
+        return {
+            normalize_topic(topic)
+            for topic in topics
+            if str(topic).strip()
+        }
+
+    except Exception as e:
+
+        print(
+            "⚠️ Could not read used_topics.json:",
+            e,
+        )
+
+        return set()
+
+
+def save_used_topics(used_topics):
+
+    normalized = sorted(
+        {
+            normalize_topic(topic)
+            for topic in used_topics
+            if str(topic).strip()
+        }
+    )
+
+    temp_file = USED_TOPICS_FILE.with_suffix(".tmp")
+
+    data = {
+        "topics": normalized,
+        "updated_at": time.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+    }
+
+    try:
+
+        with open(
+            temp_file,
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        temp_file.replace(
+            USED_TOPICS_FILE
+        )
+
+    except Exception as e:
+
+        print(
+            "⚠️ Could not save used_topics.json:",
+            e,
+        )
+
+
+def mark_topic_used(topic):
+
     used_topics = load_used_topics()
 
-    if custom_topic:
-        logger.info(f"Using custom topic provided by user: {custom_topic}")
-        return {"category": "CUSTOM", "topic": custom_topic.strip()}
+    used_topics.add(
+        normalize_topic(topic)
+    )
 
-    # Select category with smart diversity
-    if category and category in CATEGORIES:
-        selected_category = category
-    else:
-        # Check recently used categories to avoid repeating the same category consecutively
-        recent_cats = [item.get("category") for item in used_topics[-5:] if isinstance(item, dict) and item.get("category")]
-        candidate_cats = [c for c in CATEGORIES if c not in recent_cats]
-        selected_category = random.choice(candidate_cats if candidate_cats else CATEGORIES)
+    save_used_topics(
+        used_topics
+    )
 
-    logger.info(f"Selecting category: {selected_category}")
-
-    if GROQ_API_KEY:
-        try:
-            from groq import Groq
-            client = Groq(api_key=GROQ_API_KEY)
-            prompt = (
-                f"Generate ONE unique, specific, and mind-blowing educational scientific fact question about '{selected_category}' in HINDI (हिंदी भाषा).\n"
-                f"Requirements: Single interesting question in pure natural Hindi (e.g. 'ऑक्टोपस के तीन दिल क्यों होते हैं?').\n"
-                f"Return ONLY the question in Hindi text, no English, no explanation."
-            )
-            completion = client.chat.completions.create(
-                model="groq/compound",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.8,
-                max_tokens=100
-            )
-            ai_topic = completion.choices[0].message.content.strip().strip('"').strip("'")
-            if "\n" in ai_topic:
-                ai_topic = ai_topic.split("\n")[0].strip()
-            if len(ai_topic) > 120:
-                ai_topic = ai_topic[:117] + "..."
-
-            if ai_topic and not is_topic_used(ai_topic, used_topics):
-                logger.info(f"AI generated unique Hindi topic: {ai_topic}")
-                return {"category": selected_category, "topic": ai_topic}
-        except Exception as e:
-            logger.warning(f"Groq AI topic generation fallback due to: {e}")
-
-    category_seeds = SEED_FACT_TOPICS.get(selected_category, SEED_FACT_TOPICS["SCIENCE"])
-    random.shuffle(category_seeds)
-    for topic_candidate in category_seeds:
-        if not is_topic_used(topic_candidate, used_topics):
-            logger.info(f"Selected unique topic from Hindi seed database: {topic_candidate}")
-            return {"category": selected_category, "topic": topic_candidate}
-
-    fallback_topic = f"{selected_category} के बारे में यह अनोखा रहस्य क्या आप जानते हैं?"
-    logger.info(f"Selected fallback topic: {fallback_topic}")
-    return {"category": selected_category, "topic": fallback_topic}
+    print(
+        f"💾 Topic saved to {USED_TOPICS_FILE}: {topic}"
+    )
 
 
-# ==============================================================================
-# 4. FACT RESEARCHER
-# ==============================================================================
-def research_fact(topic_dict: dict) -> dict:
-    topic = topic_dict.get("topic", "")
-    category = topic_dict.get("category", "")
-    logger.info(f"Researching fact for topic: '{topic}'")
+def choose_unused_topic():
 
-    if GROQ_API_KEY:
-        try:
-            from groq import Groq
-            client = Groq(api_key=GROQ_API_KEY)
-            prompt = (
-                f"You are an expert scientific fact researcher.\n"
-                f"Research this topic in HINDI (हिंदी भाषा): '{topic}' (Category: {category}).\n"
-                f"Provide a scientifically accurate, verified breakdown in simple natural Hindi.\n"
-                f"Format response as valid JSON ONLY with keys:\n"
-                f"- main_fact: Concise core scientific fact in Hindi (1-2 lines)\n"
-                f"- explanation: Detailed easy explanation in Hindi (2 lines)\n"
-                f"- interesting_detail: One mind-blowing detail in Hindi\n"
-                f"- scientific_context: Underlying mechanism in Hindi\n"
-                f"- confidence_score: Float between 0.0 and 1.0\n"
-                f"- is_reliable: Boolean true or false\n"
-                f"No markdown blocks, raw JSON only."
-            )
-            completion = client.chat.completions.create(
-                model="groq/compound",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=600
-            )
-            response_text = completion.choices[0].message.content.strip()
-            if "```" in response_text:
-                s_idx = response_text.find("{")
-                e_idx = response_text.rfind("}")
-                if s_idx != -1 and e_idx != -1:
-                    response_text = response_text[s_idx:e_idx+1]
-            
-            parsed = json.loads(response_text)
-            if parsed.get("confidence_score", 0.0) >= 0.7 and parsed.get("is_reliable", False):
-                logger.info(f"Fact researched successfully. Reliability confidence: {parsed.get('confidence_score')}")
-                parsed["topic"] = topic
-                parsed["category"] = category
-                return parsed
-        except Exception as e:
-            logger.warning(f"AI Fact research fallback due to: {e}")
+    used_topics = load_used_topics()
 
-    logger.info("Using built-in verified Hindi scientific research provider.")
-    return {
-        "topic": topic,
-        "category": category,
-        "main_fact": f"{topic} के पीछे प्रकृति का एक बेहद अद्भुत वैज्ञानिक रहस्य छुपा हुआ है।",
-        "explanation": "वैज्ञानिकों के अनुसार यह एक ऐसा प्राकृतिक विकास है जो जीवों और प्रकृति को अद्भुत क्षमता प्रदान करता है।",
-        "interesting_detail": "शोधकर्ताओं ने पाया है कि यह अनोखी खूबी ऊर्जा बचाने और जीवित रहने के लिए सबसे बड़ा हथियार है।",
-        "scientific_context": "प्राकृतिक और जैविक प्रक्रियाएं मिलकर इस चमत्कारी प्रणाली को संचालित करती हैं।",
-        "confidence_score": 0.95,
-        "is_reliable": True
-    }
-
-
-# ==============================================================================
-# 5. SCRIPT GENERATOR
-# ==============================================================================
-def generate_script(researched_fact: dict) -> dict:
-    topic = researched_fact.get("topic", "")
-    main_fact = researched_fact.get("main_fact", "")
-    explanation = researched_fact.get("explanation", "")
-    category = researched_fact.get("category", "")
-
-    logger.info("Generating Short-form Hindi script...")
-
-    if GROQ_API_KEY:
-        try:
-            from groq import Groq
-            client = Groq(api_key=GROQ_API_KEY)
-            prompt = (
-                f"Topic: '{topic}'\n"
-                f"Fact: {main_fact[:200]}\n"
-                f"Explanation: {explanation[:300]}\n\n"
-                f"You are a top-tier viral YouTube Shorts writer for Hindi Mystery, History & Mind-Blowing Facts.\n"
-                f"CRITICAL RETENTION & AUDIO MODULATION RULES:\n"
-                f"1. DURATION & PACING: Target speaking speed is 140-160 WPM. TOTAL narration MUST be strictly between 70 and 80 words (30-38 seconds runtime).\n"
-                f"2. 0-3 SECONDS (SUPER STRONG HOOK): No boring intros! Start IMMEDIATELY with an electrifying, jaw-dropping revelation, chilling mystery, or shocking question that stops the scroll (e.g. 'रुकिए! क्या आपको पता है...', 'इस जगह का ऐसा खौफनाक सच जिसे सुनकर आपके होश उड़ जाएंगे!', 'वैज्ञानिकों के पास भी इस अनसुलझे रहस्य का कोई जवाब नहीं है!').\n"
-                f"3. STORY & MYSTERY (MIDDLE): Deep, gripping, atmospheric mystery storytelling without any filler words.\n"
-                f"4. CLIMAX & REVEAL: Deliver the most shocking fact with punchy emphasis.\n"
-                f"5. ENDING / CTA: 1 sharp, provocative question for viewer comments.\n"
-                f"6. LANGUAGE: All spoken dialogue MUST be in natural HINDI (Devanagari script). Visual search queries ('search_keywords') MUST be in ENGLISH for Pexels stock video matching.\n\n"
-                f"Return JSON format ONLY:\n"
-                f"{{\n"
-                f'  "hook": "सुपर स्ट्रॉन्ग हिंदी हुक (8-12 शब्द)",\n'
-                f'  "fact": "रहस्य और मुख्य सच (1 छोटा वाक्य)",\n'
-                f'  "explanation": "गंभीर और रोमांचक व्याख्या (1-2 छोटे वाक्य)",\n'
-                f'  "surprising_detail": "चौंकाने वाला मुख्य खुलासा (1 वाक्य)",\n'
-                f'  "ending": "कमेंट के लिए तीखा सवाल (1 वाक्य)",\n'
-                f'  "full_narration": "पूरी नैरेशन 70 से 80 शब्दों के बीच",\n'
-                f'  "scenes": [\n'
-                f'     {{"scene_number": 1, "script_part": "हुक", "search_keywords": "cinematic mystery dramatic close up"}},\n'
-                f'     {{"scene_number": 2, "script_part": "फैक्ट", "search_keywords": "mysterious phenomenon 4k"}},\n'
-                f'     {{"scene_number": 3, "script_part": "व्याख्या", "search_keywords": "scientific discovery history macro"}},\n'
-                f'     {{"scene_number": 4, "script_part": "खुलासा", "search_keywords": "shocking reveal cinematic"}},\n'
-                f'     {{"scene_number": 5, "script_part": "एंडिंग", "search_keywords": "epic dramatic conclusion"}}\n'
-                f'  ]\n'
-                f"}}\n"
-                f"No markdown. Output JSON strictly."
-            )
-            completion = client.chat.completions.create(
-                model="groq/compound",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.5,
-                max_tokens=500
-            )
-            response_text = completion.choices[0].message.content.strip()
-            if "```" in response_text:
-                s_idx = response_text.find("{")
-                e_idx = response_text.rfind("}")
-                if s_idx != -1 and e_idx != -1:
-                    response_text = response_text[s_idx:e_idx+1]
-
-            script_data = json.loads(response_text)
-            words = script_data.get("full_narration", "").split()
-            if len(words) > 82:
-                script_data["full_narration"] = " ".join(words[:80])
-
-            logger.info("Tight 30-38s modulated Hindi script generated successfully via Groq AI.")
-            return script_data
-        except Exception as e:
-            logger.warning(f"AI Script generation fallback due to: {e}")
-
-    clean_fact = main_fact[:90].strip()
-    clean_exp = explanation[:110].strip()
-    hook = f"रुकिए! {topic} का एक ऐसा चौंकाने वाला रहस्य जिसे सुनकर आपके होश उड़ जाएंगे!"
-    fact = f"{clean_fact}"
-    exp = f"{clean_exp}"
-    detail = "वैज्ञानिक भी आज तक इस अद्भुत और अनसुलझी पहेली को सुलझा नहीं पाए हैं।"
-    ending = "क्या आपको इसके बारे में पहले से पता था? कमेंट्स में अपनी राय ज़रूर बताएं!"
-    full_narration = f"{hook} {fact} {exp} {detail} {ending}"
-    search_term = category.lower() if category else "nature"
-
-    scenes = [
-        {"scene_number": 1, "script_part": hook, "search_keywords": f"{search_term} mysterious dramatic"},
-        {"scene_number": 2, "script_part": fact, "search_keywords": f"{search_term} mystery cinematic"},
-        {"scene_number": 3, "script_part": exp, "search_keywords": f"{search_term} science explanation"},
-        {"scene_number": 4, "script_part": detail, "search_keywords": f"{search_term} phenomenon close up"},
-        {"scene_number": 5, "script_part": ending, "search_keywords": f"{search_term} cinematic beautiful"}
+    available = [
+        topic
+        for topic in MYSTERY_TOPICS
+        if normalize_topic(topic)
+        not in used_topics
     ]
 
-    return {
-        "hook": hook, "fact": fact, "explanation": exp,
-        "surprising_detail": detail, "ending": ending,
-        "full_narration": full_narration, "scenes": scenes
+    print(
+        f"📚 Topic history: "
+        f"{len(used_topics)} used / "
+        f"{len(MYSTERY_TOPICS)} total"
+    )
+
+    if not available:
+
+        raise RuntimeError(
+            "\n❌ ALL INDIA MYSTERY TOPICS HAVE ALREADY BEEN USED.\n"
+            "No duplicate topic will be generated.\n"
+            f"Edit {USED_TOPICS_FILE} only if you intentionally "
+            "want to reset the topic history."
+        )
+
+    topic = random.choice(
+        available
+    )
+
+    print(
+        f"🆕 Unused topic selected: {topic}"
+    )
+
+    return topic
+
+
+# ============================================================
+# STORY VALIDATION
+# ============================================================
+
+def validate_indian_story(
+    data,
+    expected_topic=None,
+):
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        raise ValueError(
+            "AI response is not a JSON object."
+        )
+
+    text_parts = [
+        str(data.get("topic", "")),
+        str(data.get("title", "")),
+        str(data.get("description", "")),
+        str(data.get("hook", "")),
+    ]
+
+    scenes = data.get(
+        "scenes",
+        [],
+    )
+
+    if not isinstance(
+        scenes,
+        list,
+    ):
+        raise ValueError(
+            "AI response contains invalid scenes."
+        )
+
+    for scene in scenes:
+
+        if isinstance(
+            scene,
+            dict,
+        ):
+
+            text_parts.extend(
+                [
+                    str(
+                        scene.get(
+                            "narration",
+                            "",
+                        )
+                    ),
+                    str(
+                        scene.get(
+                            "pexels_query",
+                            "",
+                        )
+                    ),
+                    str(
+                        scene.get(
+                            "sfx_reason",
+                            "",
+                        )
+                    ),
+                ]
+            )
+
+    combined = " ".join(
+        text_parts
+    ).lower()
+
+    if any(
+        term in combined
+        for term in FORBIDDEN_FOREIGN_TERMS
+    ):
+
+        raise ValueError(
+            "Generated story contains a forbidden foreign topic."
+        )
+
+    expected_topic_text = str(
+        expected_topic
+        or data.get(
+            "topic",
+            "",
+        )
+    ).lower()
+
+    topic_is_known_indian = any(
+        expected_topic_text.strip().lower()
+        == str(topic).strip().lower()
+        for topic in MYSTERY_TOPICS
+    )
+
+    story_mentions_india = any(
+        term in combined
+        for term in INDIA_TERMS
+    )
+
+    if not (
+        topic_is_known_indian
+        or story_mentions_india
+    ):
+
+        raise ValueError(
+            "Generated story does not clearly identify India."
+        )
+
+    if len(scenes) != 7:
+
+        raise ValueError(
+            f"Expected exactly 7 scenes, got {len(scenes)}"
+        )
+
+    for scene in scenes:
+
+        if not isinstance(
+            scene,
+            dict,
+        ):
+
+            raise ValueError(
+                "Invalid scene object."
+            )
+
+        scene[
+            "pexels_query"
+        ] = ensure_india_query(
+            scene.get(
+                "pexels_query",
+                "",
+            )
+        )
+
+        # ----------------------------------------------------
+        # Normalize SFX information.
+        # ----------------------------------------------------
+
+        raw_sfx = scene.get(
+            "sfx",
+            None,
+        )
+
+        if isinstance(
+            raw_sfx,
+            str,
+        ):
+
+            raw_sfx = raw_sfx.lower().strip()
+
+            if raw_sfx not in {
+                "whoosh",
+                "impact",
+                "heartbeat",
+                "hit",
+            }:
+
+                raw_sfx = None
+
+        else:
+
+            raw_sfx = None
+
+        if not raw_sfx:
+
+            raw_sfx = choose_sfx_from_story(
+                scene.get(
+                    "narration",
+                    "",
+                ),
+                scene.get(
+                    "sfx_reason",
+                    "",
+                ),
+                scene.get(
+                    "emotion",
+                    "",
+                ),
+                scene.get(
+                    "reaction",
+                    "",
+                ),
+                scene.get(
+                    "scene_purpose",
+                    "",
+                ),
+            )
+
+        scene["sfx"] = raw_sfx
+
+    if expected_topic:
+
+        data["topic"] = expected_topic
+
+    return data
+
+
+# ============================================================
+# SFX INTELLIGENCE
+# ============================================================
+
+SFX_NAMES = {
+    "whoosh",
+    "impact",
+    "heartbeat",
+    "hit",
+}
+
+
+def choose_sfx_from_story(
+    narration,
+    reason="",
+    emotion="",
+    reaction="",
+    scene_purpose="",
+):
+
+    text = " ".join(
+        [
+            str(narration or ""),
+            str(reason or ""),
+            str(emotion or ""),
+            str(reaction or ""),
+            str(scene_purpose or ""),
+        ]
+    ).lower()
+
+    # --------------------------------------------------------
+    # Strong shock / revelation.
+    # --------------------------------------------------------
+
+    impact_words = [
+        "खुलासा",
+        "सच सामने",
+        "सच्चाई सामने",
+        "चौंकाने",
+        "चौंका",
+        "हैरान",
+        "सबसे बड़ा",
+        "बड़ा राज",
+        "राज खुल",
+        "रहस्य खुल",
+        "सदियों बाद",
+        "पता चला",
+        "खोज",
+        "मिला",
+        "मिल गया",
+        "reveal",
+        "revealed",
+        "shocking",
+        "shock",
+        "revelation",
+        "discovered",
+        "discovery",
+        "truth",
+    ]
+
+    if any(
+        word in text
+        for word in impact_words
+    ):
+        return "impact"
+
+    # --------------------------------------------------------
+    # Sudden event / punch.
+    # --------------------------------------------------------
+
+    hit_words = [
+        "अचानक",
+        "तुरंत",
+        "धमाका",
+        "टक्कर",
+        "वार",
+        "गिरा",
+        "गिर गया",
+        "टूट",
+        "हमला",
+        "खतरा",
+        "संकट",
+        "मौत",
+        "मर गया",
+        "डरावना",
+        "भयानक",
+        "suddenly",
+        "sudden",
+        "attack",
+        "danger",
+        "death",
+        "dead",
+        "hit",
+        "crash",
+        "break",
+    ]
+
+    if any(
+        word in text
+        for word in hit_words
+    ):
+        return "hit"
+
+    # --------------------------------------------------------
+    # Fear / suspense / unknown.
+    # --------------------------------------------------------
+
+    heartbeat_words = [
+        "डर",
+        "डरावना",
+        "सस्पेंस",
+        "रहस्य",
+        "अज्ञात",
+        "अनसुलझा",
+        "जवाब नहीं",
+        "पता नहीं",
+        "आज तक",
+        "क्यों",
+        "कैसे",
+        "रात",
+        "अंधेरा",
+        "सन्नाटा",
+        "भूत",
+        "खौफ",
+        "सिद्धांत",
+        "folklore",
+        "mystery",
+        "mysterious",
+        "unknown",
+        "unexplained",
+        "suspense",
+        "fear",
+        "scary",
+        "night",
+    ]
+
+    if any(
+        word in text
+        for word in heartbeat_words
+    ):
+        return "heartbeat"
+
+    # --------------------------------------------------------
+    # Movement / transition / reveal entrance.
+    # --------------------------------------------------------
+
+    whoosh_words = [
+        "फिर",
+        "इसके बाद",
+        "अगला सुराग",
+        "सुराग",
+        "रास्ता",
+        "दरवाजा",
+        "सुरंग",
+        "अंदर",
+        "ऊपर",
+        "नीचे",
+        "तेजी",
+        "चलते",
+        "दिखाई",
+        "सामने आया",
+        "transition",
+        "move",
+        "moving",
+        "entrance",
+        "tunnel",
+        "door",
+        "clue",
+    ]
+
+    if any(
+        word in text
+        for word in whoosh_words
+    ):
+        return "whoosh"
+
+    # --------------------------------------------------------
+    # Intelligent fallback.
+    # --------------------------------------------------------
+
+    return random.choice(
+        [
+            "heartbeat",
+            "whoosh",
+            "impact",
+            "hit",
+        ]
+    )
+
+
+def get_sfx_intensity(
+    sfx_name,
+    narration,
+    reason="",
+    emotion="",
+    reaction="",
+):
+
+    text = " ".join(
+        [
+            str(narration or ""),
+            str(reason or ""),
+            str(emotion or ""),
+            str(reaction or ""),
+        ]
+    ).lower()
+
+    intensity = 1.0
+
+    if sfx_name == "heartbeat":
+        intensity = 0.78
+
+    elif sfx_name == "whoosh":
+        intensity = 0.92
+
+    elif sfx_name == "impact":
+        intensity = 1.15
+
+    elif sfx_name == "hit":
+        intensity = 1.05
+
+    # Extra emphasis for shock/reveal.
+    strong_words = [
+        "खुलासा",
+        "चौंक",
+        "सच",
+        "सबसे बड़ा",
+        "अचानक",
+        "रहस्य",
+        "मौत",
+        "खतरा",
+        "reveal",
+        "shock",
+        "sudden",
+        "truth",
+        "danger",
+    ]
+
+    if any(
+        word in text
+        for word in strong_words
+    ):
+        intensity *= 1.08
+
+    return max(
+        0.55,
+        min(
+            1.25,
+            intensity,
+        ),
+    )
+
+
+# ============================================================
+# SEO GENERATOR
+# ============================================================
+
+def clean_hashtag(value):
+
+    value = str(
+        value or ""
+    ).strip()
+
+    if not value:
+        return ""
+
+    value = value.replace(
+        "#",
+        "",
+    )
+
+    value = "".join(
+        char
+        for char in value
+        if char.isalnum()
+        or char in "_"
+    )
+
+    return (
+        f"#{value}"
+        if value
+        else ""
+    )
+
+
+def normalize_seo(
+    data,
+    topic,
+):
+
+    seo = data.get(
+        "seo"
+    )
+
+    if not isinstance(
+        seo,
+        dict,
+    ):
+        seo = {}
+
+    title = str(
+        seo.get(
+            "title"
+        )
+        or data.get(
+            "title"
+        )
+        or f"{topic} | Indian Mystery #Shorts"
+    ).strip()
+
+    description = str(
+        seo.get(
+            "description"
+        )
+        or data.get(
+            "description"
+        )
+        or ""
+    ).strip()
+
+    tags = seo.get(
+        "tags",
+        [],
+    )
+
+    if not isinstance(
+        tags,
+        list,
+    ):
+        tags = []
+
+    hashtags = seo.get(
+        "hashtags",
+        [],
+    )
+
+    if not isinstance(
+        hashtags,
+        list,
+    ):
+        hashtags = []
+
+    clean_tags = []
+
+    for tag in tags:
+
+        tag = str(
+            tag
+        ).strip()
+
+        if (
+            tag
+            and tag.lower()
+            not in {
+                x.lower()
+                for x in clean_tags
+            }
+        ):
+
+            clean_tags.append(
+                tag
+            )
+
+    clean_hashtags = []
+
+    for hashtag in hashtags:
+
+        hashtag = clean_hashtag(
+            hashtag
+        )
+
+        if (
+            hashtag
+            and hashtag.lower()
+            not in {
+                x.lower()
+                for x in clean_hashtags
+            }
+        ):
+
+            clean_hashtags.append(
+                hashtag
+            )
+
+    fallback_tags = [
+        "Indian Mystery",
+        "Indian History",
+        "India Facts",
+        "Hindi Mystery",
+        "Hindi Facts",
+        "Indian History Facts",
+        topic,
+    ]
+
+    for tag in fallback_tags:
+
+        if (
+            tag.lower()
+            not in {
+                x.lower()
+                for x in clean_tags
+            }
+        ):
+
+            clean_tags.append(
+                tag
+            )
+
+    fallback_hashtags = [
+        "#Shorts",
+        "#IndianMystery",
+        "#IndianHistory",
+        "#IndiaFacts",
+    ]
+
+    for hashtag in fallback_hashtags:
+
+        if (
+            hashtag.lower()
+            not in {
+                x.lower()
+                for x in clean_hashtags
+            }
+        ):
+
+            clean_hashtags.append(
+                hashtag
+            )
+
+    clean_tags = clean_tags[:30]
+
+    hashtag_text = " ".join(
+        clean_hashtags[:12]
+    )
+
+    if hashtag_text:
+
+        if hashtag_text.lower() not in description.lower():
+
+            description = (
+                description.rstrip()
+                + "\n\n"
+                + hashtag_text
+            )
+
+    title = title[:100]
+
+    data["seo"] = {
+        "title": title,
+        "description": description,
+        "tags": clean_tags,
+        "hashtags": clean_hashtags,
     }
 
+    data["title"] = title
+    data["description"] = description
 
-# ==============================================================================
-# 6. VOICEOVER GENERATOR (EDGE-TTS)
-# ==============================================================================
-async def generate_tts_async(text: str, output_file: Path, voice: str, rate: str, pitch: str):
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
-    await communicate.save(str(output_file))
+    return data
 
-def get_audio_duration(audio_file: Path) -> float:
-    try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(audio_file)
+
+# ============================================================
+# STORY GENERATOR
+# ============================================================
+
+def generate_mystery_story():
+
+    topic = choose_unused_topic()
+
+    print("\n" + "=" * 75)
+    print(
+        "🧠 GENERATING HIGH-RETENTION MYSTERY SHORT"
+    )
+    print(
+        "🎯 Topic:",
+        topic,
+    )
+    print("=" * 75)
+
+    prompt = f"""
+You are a professional Hindi YouTube Shorts writer,
+Indian dark-history researcher and SEO specialist.
+
+INDIA ONLY.
+
+SELECTED TOPIC:
+{topic}
+
+Create ONE factual, highly engaging Hindi YouTube Short.
+
+TARGET:
+20-32 seconds.
+Exactly 7 visual scenes.
+
+============================================================
+EXTREMELY IMPORTANT HOOK RULE
+============================================================
+
+THE FIRST 0-3 SECONDS ARE THE MOST IMPORTANT PART.
+
+Scene 1 MUST:
+- start at 0 seconds
+- end at 3 seconds
+- contain the strongest curiosity hook
+- use 8-14 Hindi words when possible
+- be naturally speakable in about 3 seconds
+- create an immediate curiosity gap
+- preferably mention a specific Indian place/object/person
+- NEVER waste time with greetings
+
+The hook MUST be EXACTLY the same as:
+"hook"
+and:
+scenes[0].narration
+
+NEVER start with:
+"आज हम बात करेंगे..."
+"क्या आप जानते हैं..."
+"नमस्कार दोस्तों..."
+"दोस्तों आज की वीडियो में..."
+
+============================================================
+STORY STRUCTURE
+============================================================
+
+0-3 sec:
+EXTREMELY STRONG HOOK.
+
+3-7 sec:
+Mystery setup.
+
+7-17 sec:
+Clue chain.
+
+17-27 sec:
+Strongest documented revelation.
+
+Final seconds:
+Unanswered question / comment bait.
+
+Final scene MUST ask a question that encourages comments.
+
+============================================================
+FACTUAL RULE
+============================================================
+
+Only established information may be presented as fact.
+
+For uncertain claims use wording such as:
+"एक सिद्धांत के अनुसार..."
+"कुछ इतिहासकार मानते हैं..."
+"लोककथाओं के अनुसार..."
+"आज तक इसका निश्चित जवाब नहीं मिला..."
+"इस दावे की स्वतंत्र पुष्टि नहीं हुई है..."
+
+Never invent:
+- dates
+- people
+- discoveries
+- scientific claims
+- quotes
+- archaeological evidence
+
+Clearly separate folklore from documented history.
+
+============================================================
+VISUAL RULE
+============================================================
+
+Every pexels_query MUST target India or an Indian location.
+
+Never request foreign visuals.
+
+The visual query should match the exact narration
+as closely as possible.
+
+============================================================
+SFX INTELLIGENCE
+============================================================
+
+DO NOT assign SFX using a fixed scene-number pattern.
+
+Choose the SFX according to the actual story/reaction.
+
+Available SFX:
+- whoosh
+- impact
+- heartbeat
+- hit
+
+Use:
+
+whoosh:
+movement, transition, entering a place, reveal transition,
+rapid clue movement.
+
+impact:
+major reveal, shocking historical fact, strongest discovery.
+
+heartbeat:
+fear, suspense, uncertainty, unexplained mystery,
+dark atmosphere.
+
+hit:
+sudden event, danger, dramatic punch, unexpected moment.
+
+Every scene should have a suitable SFX when possible.
+
+Return:
+"sfx": "whoosh"
+"sfx_reason": "movement into the hidden tunnel"
+"emotion": "curiosity"
+"reaction": "sudden reveal"
+
+============================================================
+CAPTION RULE
+============================================================
+
+DO NOT CREATE CAPTIONS.
+
+There is NO caption field.
+
+============================================================
+SEO RULE
+============================================================
+
+Generate SEO specifically for this exact video.
+
+TITLE:
+- Hindi
+- curiosity-driven
+- natural
+- not misleading
+- maximum 100 characters
+- include #Shorts naturally when appropriate
+
+DESCRIPTION:
+- Hindi
+- around 100-180 words
+- summarize actual story
+- include naturally relevant search keywords
+- do NOT keyword-stuff
+- include relevant hashtags
+
+TAGS:
+Generate 12-25 highly relevant YouTube search tags.
+
+HASHTAGS:
+Generate 6-12 relevant hashtags.
+
+============================================================
+RETURN ONLY VALID JSON
+============================================================
+
+{{
+  "topic": "{topic}",
+  "title": "... #Shorts",
+  "description": "...",
+  "hook": "...",
+  "scenes": [
+    {{
+      "scene_number": 1,
+      "start_time": 0,
+      "end_time": 3,
+      "narration": "...",
+      "pexels_query": "...",
+      "sfx": "heartbeat",
+      "sfx_reason": "suspenseful opening",
+      "emotion": "fear",
+      "reaction": "curiosity",
+      "scene_purpose": "hook"
+    }}
+  ],
+  "seo": {{
+    "title": "... #Shorts",
+    "description": "...",
+    "tags": [
+      "...",
+      "..."
+    ],
+    "hashtags": [
+      "#...",
+      "#..."
+    ]
+  }}
+}}
+
+IMPORTANT:
+Exactly 7 scenes.
+No caption fields.
+Scene 1 is exactly 0-3 seconds.
+Scene 1 narration MUST equal hook.
+SFX must be selected according to the story, NOT scene number.
+"""
+
+    response = groq_client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a factual, high-retention Hindi "
+                    "Indian dark-history YouTube Shorts writer "
+                    "and SEO specialist."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        temperature=0.82,
+        response_format={
+            "type": "json_object"
+        },
+    )
+
+    data = json.loads(
+        response.choices[0].message.content
+    )
+
+    data = validate_indian_story(
+        data,
+        expected_topic=topic,
+    )
+
+    # --------------------------------------------------------
+    # HARD 0-3 SECOND HOOK
+    # --------------------------------------------------------
+
+    hook = str(
+        data.get(
+            "hook",
+            "",
+        )
+    ).strip()
+
+    if not hook:
+
+        hook = (
+            "इस भारतीय रहस्य का जवाब आज तक क्यों नहीं मिला?"
+        )
+
+    hook_words = hook.split()
+
+    if len(hook_words) > 18:
+
+        hook = (
+            " ".join(
+                hook_words[:18]
+            )
+            .rstrip(
+                " ,.!?"
+            )
+            + "?"
+        )
+
+    scenes = data["scenes"]
+
+    if len(scenes) != 7:
+
+        raise ValueError(
+            "Story does not contain exactly 7 scenes."
+        )
+
+    for index, scene in enumerate(
+        scenes,
+        start=1,
+    ):
+
+        scene["scene_number"] = index
+
+    scenes[0]["start_time"] = 0
+    scenes[0]["end_time"] = 3
+    scenes[0]["narration"] = hook
+
+    # Make sure every scene has intelligent SFX.
+    for scene in scenes:
+
+        scene["sfx"] = choose_sfx_from_story(
+            scene.get(
+                "narration",
+                "",
+            ),
+            scene.get(
+                "sfx_reason",
+                "",
+            ),
+            scene.get(
+                "emotion",
+                "",
+            ),
+            scene.get(
+                "reaction",
+                "",
+            ),
+            scene.get(
+                "scene_purpose",
+                "",
+            ),
+        )
+
+    # Remove accidental caption fields.
+    for scene in scenes:
+        scene.pop(
+            "caption",
+            None,
+        )
+
+    data = normalize_seo(
+        data,
+        topic,
+    )
+
+    data["title"] = data[
+        "seo"
+    ][
+        "title"
+    ]
+
+    data["description"] = data[
+        "seo"
+    ][
+        "description"
+    ]
+
+    print(
+        "\n🔥 0-3 SEC STRONG HOOK:"
+    )
+
+    print(
+        hook
+    )
+
+    print(
+        "\n🎬 SEO TITLE:"
+    )
+
+    print(
+        data["seo"]["title"]
+    )
+
+    print(
+        "\n📝 SEO DESCRIPTION:"
+    )
+
+    print(
+        data["seo"]["description"]
+    )
+
+    print(
+        "\n🏷️ SEO TAGS:"
+    )
+
+    print(
+        ", ".join(
+            data["seo"]["tags"]
+        )
+    )
+
+    print(
+        "\n#️⃣ HASHTAGS:"
+    )
+
+    print(
+        " ".join(
+            data["seo"]["hashtags"]
+        )
+    )
+
+    print(
+        "\n💥 STORY-BASED SFX PLAN:"
+    )
+
+    for scene in scenes:
+
+        print(
+            f"Scene {scene['scene_number']}: "
+            f"{scene['sfx']} | "
+            f"{scene.get('sfx_reason', '')}"
+        )
+
+    return data
+
+
+# ============================================================
+# PEXELS QUERY FALLBACK GENERATOR
+# ============================================================
+
+def generate_fallback_queries(
+    original_query,
+    narration,
+    topic,
+    scene_number,
+):
+
+    original_query = str(
+        original_query or ""
+    ).strip()
+
+    narration = str(
+        narration or ""
+    ).strip()
+
+    topic = str(
+        topic or ""
+    ).strip()
+
+    queries = []
+
+    # Original query first.
+    if original_query:
+        queries.append(
+            original_query
+        )
+
+    # Exact topic.
+    queries.extend(
+        [
+            topic,
+            f"{topic} India",
+            f"{topic} historical monument India",
         ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        return float(result.stdout.strip())
-    except Exception as e:
-        logger.warning(f"ffprobe audio duration failed: {e}. Estimating duration.")
-        return 35.0
+    )
 
-async def generate_segment_tts_async(text: str, output_file: Path, voice: str, rate: str, pitch: str):
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
-    await communicate.save(str(output_file))
+    # Narration.
+    if narration:
+        queries.extend(
+            [
+                f"India {narration}",
+                f"Indian history {narration}",
+            ]
+        )
 
-def generate_voiceover(script_data: dict) -> dict:
-    narration_text = script_data.get("full_narration", "")
-    if not narration_text:
-        raise ValueError("Script narration text is empty!")
+    # Generic scene-specific India fallbacks.
+    fallback_sets = [
+        [
+            "India ancient fort",
+            "Indian fort aerial",
+            "Indian historical fort",
+            "Rajasthan fort India",
+        ],
+        [
+            "India ancient temple",
+            "Indian temple architecture",
+            "Indian historical temple",
+            "India temple aerial",
+        ],
+        [
+            "India ancient ruins",
+            "Indian archaeological site",
+            "India historical ruins",
+            "Indian ancient architecture",
+        ],
+        [
+            "India cave temple",
+            "Indian caves history",
+            "India archaeological caves",
+            "Indian stone architecture",
+        ],
+        [
+            "India old city",
+            "Indian heritage city",
+            "Indian historical place",
+            "India heritage architecture",
+        ],
+        [
+            "India historical monument",
+            "Indian heritage monument",
+            "India ancient architecture",
+            "Indian history location",
+        ],
+        [
+            "India mysterious place",
+            "Indian historical place",
+            "India ancient monument",
+            "Indian heritage site",
+        ],
+    ]
 
-    temp_audio_path = TEMP_DIR / "voiceover.mp3"
-    if temp_audio_path.exists():
+    index = max(
+        0,
+        min(
+            scene_number - 1,
+            len(fallback_sets) - 1,
+        ),
+    )
+
+    queries.extend(
+        fallback_sets[index]
+    )
+
+    # Remove duplicates while preserving order.
+    clean = []
+
+    seen = set()
+
+    for query in queries:
+
         try:
-            temp_audio_path.unlink()
+
+            query = ensure_india_query(
+                query
+            )
+
+        except Exception:
+
+            continue
+
+        key = query.lower().strip()
+
+        if key not in seen:
+
+            seen.add(key)
+
+            clean.append(
+                query
+            )
+
+    # Shuffle fallback portion a little,
+    # but keep original query first.
+    if len(clean) > 1:
+
+        first = clean[0]
+
+        rest = clean[1:]
+
+        random.shuffle(
+            rest
+        )
+
+        clean = [
+            first
+        ] + rest
+
+    return clean[
+        :MAX_PEXELS_QUERY_ATTEMPTS
+    ]
+
+
+# ============================================================
+# PEXELS SEARCH
+# ============================================================
+
+def search_pexels_video(
+    query,
+):
+
+    query = ensure_india_query(
+        query
+    )
+
+    print(
+        f"\n🔎 PEXELS SEARCH: {query}"
+    )
+
+    url = (
+        "https://api.pexels.com/videos/search"
+    )
+
+    headers = {
+        "Authorization": PEXELS_API_KEY,
+        "User-Agent": "Mozilla/5.0",
+    }
+
+    orientations = [
+        "portrait",
+        "landscape",
+    ]
+
+    for orientation in orientations:
+
+        params = {
+            "query": query,
+            "per_page": 20,
+            "orientation": orientation,
+            "size": "large",
+        }
+
+        for attempt in range(
+            1,
+            4,
+        ):
+
+            try:
+
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=(
+                        20,
+                        45,
+                    ),
+                )
+
+                if response.status_code != 200:
+
+                    print(
+                        f"❌ Pexels error "
+                        f"{response.status_code}"
+                    )
+
+                    if response.status_code in {
+                        429,
+                        500,
+                        502,
+                        503,
+                        504,
+                    }:
+
+                        time.sleep(
+                            2 * attempt
+                        )
+
+                        continue
+
+                    break
+
+                data = response.json()
+
+                videos = data.get(
+                    "videos",
+                    [],
+                )
+
+                if not videos:
+                    break
+
+                candidates = []
+
+                for video in videos:
+
+                    for file in video.get(
+                        "video_files",
+                        [],
+                    ):
+
+                        width = (
+                            file.get(
+                                "width"
+                            )
+                            or 0
+                        )
+
+                        height = (
+                            file.get(
+                                "height"
+                            )
+                            or 0
+                        )
+
+                        link = file.get(
+                            "link"
+                        )
+
+                        if not link:
+                            continue
+
+                        if (
+                            width >= 720
+                            or height >= 720
+                        ):
+
+                            candidates.append(
+                                {
+                                    "url": link,
+                                    "width": width,
+                                    "height": height,
+                                    "duration": video.get(
+                                        "duration",
+                                        0,
+                                    ),
+                                }
+                            )
+
+                if not candidates:
+                    break
+
+                vertical = [
+                    x
+                    for x in candidates
+                    if x["height"] > x["width"]
+                ]
+
+                if vertical:
+                    candidates = vertical
+
+                candidates.sort(
+                    key=lambda x: (
+                        x["width"]
+                        * x["height"]
+                    ),
+                    reverse=True,
+                )
+
+                selected_pool = candidates[
+                    :min(
+                        10,
+                        len(candidates),
+                    )
+                ]
+
+                selected = random.choice(
+                    selected_pool
+                )
+
+                print(
+                    "✅ Selected:",
+                    selected["width"],
+                    "x",
+                    selected["height"],
+                    "| Duration:",
+                    selected["duration"],
+                )
+
+                return selected
+
+            except Exception as e:
+
+                print(
+                    f"⚠️ Pexels attempt "
+                    f"{attempt}/3 failed:",
+                    e,
+                )
+
+                if attempt < 3:
+
+                    time.sleep(
+                        3 * attempt
+                    )
+
+    return None
+
+
+# ============================================================
+# GET RELATED FOOTAGE WITH FALLBACKS
+# ============================================================
+
+def get_related_scene_video(
+    scene_number,
+    query,
+    narration,
+    topic,
+):
+
+    queries = generate_fallback_queries(
+        original_query=query,
+        narration=narration,
+        topic=topic,
+        scene_number=scene_number,
+    )
+
+    print(
+        "\n"
+        + "-" * 70
+    )
+
+    print(
+        f"🎥 SCENE {scene_number} "
+        f"FOOTAGE SEARCH"
+    )
+
+    print(
+        f"🎯 Original query: {query}"
+    )
+
+    print(
+        f"🔁 Fallback queries available: "
+        f"{len(queries)}"
+    )
+
+    print(
+        "-" * 70
+    )
+
+    for attempt, fallback_query in enumerate(
+        queries,
+        start=1,
+    ):
+
+        print(
+            f"\n🔎 Scene {scene_number} "
+            f"visual attempt "
+            f"{attempt}/{len(queries)}"
+        )
+
+        print(
+            f"Query: {fallback_query}"
+        )
+
+        result = search_pexels_video(
+            fallback_query
+        )
+
+        if not result:
+
+            print(
+                "⚠️ No footage found."
+            )
+
+            continue
+
+        filename = (
+            f"scene_{scene_number}.mp4"
+        )
+
+        downloaded = download_video(
+            result["url"],
+            filename,
+        )
+
+        if downloaded:
+
+            print(
+                f"✅ Scene {scene_number} "
+                f"footage ready."
+            )
+
+            return downloaded
+
+        print(
+            "⚠️ Download failed. "
+            "Trying another related query..."
+        )
+
+    print(
+        f"\n❌ Scene {scene_number}: "
+        "ALL RELATED FOOTAGE ATTEMPTS FAILED."
+    )
+
+    return None
+
+
+# ============================================================
+# DOWNLOAD VIDEO
+# ============================================================
+
+def download_video(
+    url,
+    filename,
+):
+
+    path = CLIPS_DIR / filename
+
+    # Remove old file first.
+    try:
+
+        if path.exists():
+            path.unlink()
+
+    except Exception:
+        pass
+
+    print(
+        f"⬇️ Downloading {filename}"
+    )
+
+    for attempt in range(
+        1,
+        4,
+    ):
+
+        try:
+
+            print(
+                f"   Download attempt "
+                f"{attempt}/3"
+            )
+
+            with requests.get(
+                url,
+                stream=True,
+                timeout=(
+                    20,
+                    180,
+                ),
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 "
+                        "(Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 "
+                        "Chrome/151 Safari/537.36"
+                    )
+                },
+            ) as response:
+
+                response.raise_for_status()
+
+                with open(
+                    path,
+                    "wb",
+                ) as file:
+
+                    for chunk in response.iter_content(
+                        chunk_size=1024 * 1024
+                    ):
+
+                        if chunk:
+                            file.write(
+                                chunk
+                            )
+
+            if (
+                path.exists()
+                and path.stat().st_size > 10000
+            ):
+
+                print(
+                    "✅ Saved:",
+                    path,
+                )
+
+                return str(path.resolve())
+
+        except Exception as e:
+
+            print(
+                f"⚠️ Download attempt "
+                f"{attempt} failed:",
+                e,
+            )
+
+            if attempt < 3:
+
+                time.sleep(
+                    3 * attempt
+                )
+
+    print(
+        f"❌ Could not download "
+        f"{filename}"
+    )
+
+    return None
+
+
+# ============================================================
+# VOICE
+# ============================================================
+
+async def create_voice(
+    text,
+    output_file,
+):
+    for attempt in range(1, 4):
+        try:
+            communicate = edge_tts.Communicate(
+                text=text,
+                voice=VOICE,
+                rate=VOICE_RATE,
+                pitch=VOICE_PITCH,
+            )
+            await communicate.save(output_file)
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
+                return True
+        except Exception as err:
+            print(f"⚠️ Edge-TTS attempt {attempt} failed: {err}")
+            await asyncio.sleep(1.5)
+            
+    # Fallback to gTTS if Edge-TTS network times out
+    try:
+        from gtts import gTTS
+        print("🎙️ Falling back to gTTS Hindi voice...")
+        tts = gTTS(text=text, lang="hi")
+        tts.save(output_file)
+        if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
+            return True
+    except Exception as gerr:
+        print(f"⚠️ gTTS fallback error: {gerr}")
+        
+    return False
+
+
+def generate_voice(
+    text,
+    scene_number,
+):
+
+    filename = (
+        AUDIO_DIR
+        / f"voice_{scene_number}.mp3"
+    ).resolve()
+
+    print(
+        f"🎙️ Generating Natural Hindi voice for scene {scene_number}"
+    )
+
+    # First try ElevenLabs if API key configured
+    if ELEVENLABS_KEY and generate_elevenlabs_voice(text, str(filename)):
+        return str(filename)
+
+    # Fallback to Edge-TTS / gTTS
+    success = asyncio.run(
+        create_voice(
+            text,
+            str(filename),
+        )
+    )
+
+    if (
+        not success
+        or not filename.exists()
+        or filename.stat().st_size < 1000
+    ):
+
+        raise RuntimeError(
+            f"Voice generation failed "
+            f"for scene {scene_number}."
+        )
+
+    return str(filename)
+
+
+# ============================================================
+# VIDEO FORMAT
+# ============================================================
+
+def prepare_clip_for_shorts(
+    clip
+):
+
+    width = clip.w
+    height = clip.h
+
+    target_ratio = (
+        VIDEO_WIDTH
+        / VIDEO_HEIGHT
+    )
+
+    current_ratio = (
+        width
+        / height
+    )
+
+    if current_ratio > target_ratio:
+
+        new_width = int(
+            height
+            * target_ratio
+        )
+
+        x1 = (
+            width
+            - new_width
+        ) // 2
+
+        clip = clip.cropped(
+            x1=x1,
+            x2=x1 + new_width,
+        )
+
+    else:
+
+        new_height = int(
+            width
+            / target_ratio
+        )
+
+        y1 = (
+            height
+            - new_height
+        ) // 2
+
+        clip = clip.cropped(
+            y1=y1,
+            y2=y1 + new_height,
+        )
+
+    return clip.resized(
+        width=VIDEO_WIDTH,
+        height=VIDEO_HEIGHT,
+    )
+
+
+def create_rapid_segments(
+    video,
+    target_duration,
+):
+
+    if video.duration <= 0:
+        return []
+
+    segments = []
+
+    segment_count = max(
+        2,
+        math.ceil(
+            target_duration
+            / 2.5
+        ),
+    )
+
+    segment_duration = (
+        target_duration
+        / segment_count
+    )
+
+    for i in range(
+        segment_count
+    ):
+
+        if (
+            video.duration
+            <= segment_duration
+        ):
+
+            start = 0
+
+        else:
+
+            available = (
+                video.duration
+                - segment_duration
+            )
+
+            start = (
+                available
+                * i
+                / max(
+                    1,
+                    segment_count - 1,
+                )
+            )
+
+        end = min(
+            start + segment_duration,
+            video.duration,
+        )
+
+        if end <= start:
+            continue
+
+        piece = video.subclipped(
+            start,
+            end,
+        )
+
+        piece = prepare_clip_for_shorts(
+            piece
+        )
+
+        try:
+
+            if i % 3 == 0:
+
+                piece = piece.with_effects(
+                    [
+                        vfx.CrossFadeIn(
+                            0.08
+                        )
+                    ]
+                )
+
         except Exception:
             pass
 
-    logger.info(f"Generating modulated voiceover using Edge TTS ({DEFAULT_VOICE})...")
-    
-    hook = script_data.get("hook", "").strip()
-    fact = script_data.get("fact", "").strip()
-    explanation = script_data.get("explanation", "").strip()
-    detail = script_data.get("surprising_detail", "").strip()
-    ending = script_data.get("ending", "").strip()
+        segments.append(
+            piece
+        )
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    hook_duration = 3.2
-    
-    try:
-        if hook and (fact or explanation) and detail:
-            story_text = f"{fact} {explanation}".strip()
-            
-            h_file = TEMP_DIR / "seg_hook.mp3"
-            s_file = TEMP_DIR / "seg_story.mp3"
-            r_file = TEMP_DIR / "seg_reveal.mp3"
-            e_file = TEMP_DIR / "seg_ending.mp3"
-            
-            # Voice Modulation:
-            # 1. Hook (0-3s): High Energy & Curiosity (+14% rate, +4Hz pitch)
-            # 2. Story / Mystery: Deep, serious, suspenseful tone (+8% rate, -2Hz pitch)
-            # 3. Climax / Reveal: Dramatic, heavier, slightly paused delivery (+4% rate, -3Hz pitch)
-            # 4. Ending / CTA: Sharp, punchy delivery (+10% rate, +2Hz pitch)
-            loop.run_until_complete(asyncio.gather(
-                generate_segment_tts_async(hook, h_file, DEFAULT_VOICE, "+14%", "+4Hz"),
-                generate_segment_tts_async(story_text, s_file, DEFAULT_VOICE, "+8%", "-2Hz"),
-                generate_segment_tts_async(detail, r_file, DEFAULT_VOICE, "+4%", "-3Hz"),
-                generate_segment_tts_async(ending, e_file, DEFAULT_VOICE, "+10%", "+2Hz"),
-            ))
-            
-            h_dur = get_audio_duration(h_file)
-            s_dur = get_audio_duration(s_file)
-            r_dur = get_audio_duration(r_file)
-            e_dur = get_audio_duration(e_file)
-            hook_duration = h_dur + 0.40  # includes 400ms micro-pause
-            
-            sections_info = [
-                {"text": hook, "duration": h_dur, "pause_after": 0.40},
-                {"text": story_text, "duration": s_dur, "pause_after": 0.30},
-                {"text": detail, "duration": r_dur, "pause_after": 0.25},
-                {"text": ending, "duration": e_dur, "pause_after": 0.0},
-            ]
-            
-            # Micro-pauses: 400ms after hook, 300ms before reveal, 250ms before ending
-            silence_400 = "aevalsrc=0:d=0.40[s1]"
-            silence_300 = "aevalsrc=0:d=0.30[s2]"
-            silence_250 = "aevalsrc=0:d=0.25[s3]"
-            
-            concat_cmd = [
-                "ffmpeg", "-y",
-                "-i", str(h_file),
-                "-i", str(s_file),
-                "-i", str(r_file),
-                "-i", str(e_file),
-                "-filter_complex",
-                f"{silence_400};{silence_300};{silence_250};[0:a][s1][1:a][s2][2:a][s3][3:a]concat=n=7:v=0:a=1[aout]",
-                "-map", "[aout]",
-                "-c:a", "libmp3lame", "-b:a", "192k",
-                str(temp_audio_path)
-            ]
-            subprocess.run(concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            logger.info("Modular voice modulation and micro-pauses assembled successfully!")
-        else:
-            raise ValueError("Incomplete script parts, falling back to unified TTS")
-    except Exception as e:
-        logger.warning(f"Voice modulation fallback to unified TTS: {e}")
-        loop.run_until_complete(
-            generate_tts_async(
-                text=narration_text,
-                output_file=temp_audio_path,
-                voice=DEFAULT_VOICE,
-                rate="+10%",
-                pitch=TTS_PITCH
+    return segments
+
+
+# ============================================================
+# AUDIO / SFX
+# ============================================================
+
+def load_sfx(
+    effect_name
+):
+
+    mapping = {
+        "whoosh": WHOOSH_FILE,
+        "impact": IMPACT_FILE,
+        "heartbeat": HEARTBEAT_FILE,
+        "hit": HIT_FILE,
+    }
+
+    file_path = mapping.get(
+        str(
+            effect_name or ""
+        ).lower().strip()
+    )
+
+    if (
+        not file_path
+        or not file_path.exists()
+    ):
+
+        return None
+
+    return str(file_path)
+
+
+def get_available_sfx():
+
+    available = []
+
+    for name in (
+        "whoosh",
+        "impact",
+        "heartbeat",
+        "hit",
+    ):
+
+        if load_sfx(name):
+            available.append(name)
+
+    return available
+
+
+def make_looped_audio(
+    audio,
+    duration,
+):
+
+    if audio.duration >= duration:
+
+        return audio.subclipped(
+            0,
+            duration,
+        )
+
+    pieces = []
+
+    remaining = duration
+
+    while remaining > 0:
+
+        part_duration = min(
+            audio.duration,
+            remaining,
+        )
+
+        pieces.append(
+            audio.subclipped(
+                0,
+                part_duration,
             )
         )
-        total_d = get_audio_duration(temp_audio_path)
-        sections_info = [{"text": narration_text, "duration": total_d, "pause_after": 0.0}]
-    finally:
-        loop.close()
 
-    duration = get_audio_duration(temp_audio_path)
-    logger.info(f"Voiceover generated successfully! Duration: {duration:.2f} seconds (Hook: {hook_duration:.2f}s).")
-    return {
-        "audio_path": str(temp_audio_path),
-        "duration": duration,
-        "hook_duration": hook_duration,
-        "sections": sections_info
-    }
+        remaining -= part_duration
 
-
-# ==============================================================================
-# 7. MEDIA FINDER (PEXELS API + PROCEDURAL GRAPHICS FALLBACK)
-# ==============================================================================
-def fetch_pexels_media(query: str, index: int) -> str:
-    if not PEXELS_API_KEY:
-        return None
-
-    headers = {"Authorization": PEXELS_API_KEY}
-    try:
-        url = f"https://api.pexels.com/videos/search?query={query}&per_page=5&orientation=portrait"
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            videos = res.json().get("videos", [])
-            if videos:
-                selected_video = random.choice(videos)
-                for vf in selected_video.get("video_files", []):
-                    if vf.get("width") == 1080 and vf.get("height") == 1920:
-                        download_url = vf.get("link")
-                        out_path = TEMP_DIR / f"scene_{index}_pexels.mp4"
-                        v_res = requests.get(download_url, timeout=15)
-                        if v_res.status_code == 200:
-                            with open(out_path, "wb") as f:
-                                f.write(v_res.content)
-                            logger.info(f"Downloaded Pexels vertical video for scene {index} ('{query}')")
-                            return str(out_path)
-    except Exception as e:
-        logger.debug(f"Pexels video fetch failed: {e}")
-
-    try:
-        url = f"https://api.pexels.com/v1/search?query={query}&per_page=5&orientation=portrait"
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            photos = res.json().get("photos", [])
-            if photos:
-                selected_photo = random.choice(photos)
-                img_url = selected_photo.get("src", {}).get("large2x") or selected_photo.get("src", {}).get("large")
-                if img_url:
-                    out_path = TEMP_DIR / f"scene_{index}_pexels.jpg"
-                    img_res = requests.get(img_url, timeout=10)
-                    if img_res.status_code == 200:
-                        with open(out_path, "wb") as f:
-                            f.write(img_res.content)
-                        logger.info(f"Downloaded Pexels photo for scene {index} ('{query}')")
-                        return str(out_path)
-    except Exception as e:
-        logger.debug(f"Pexels photo fetch failed: {e}")
-
-    return None
-
-def generate_procedural_graphic(scene_index: int, topic: str, keywords: str, script_part: str) -> str:
-    out_path = TEMP_DIR / f"scene_{scene_index}_graphic.png"
-    palettes = [
-        ((15, 23, 42), (30, 58, 138), (59, 130, 246)),
-        ((20, 83, 45), (22, 101, 52), (34, 197, 94)),
-        ((88, 28, 135), (126, 34, 206), (168, 85, 247)),
-        ((124, 45, 18), (194, 65, 12), (249, 115, 22)),
-        ((15, 118, 110), (13, 148, 136), (20, 184, 166))
-    ]
-    c1, c2, accent = palettes[scene_index % len(palettes)]
-
-    img = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), color=c1)
-    draw = ImageDraw.Draw(img)
-
-    for y in range(VIDEO_HEIGHT):
-        ratio = y / VIDEO_HEIGHT
-        r = int(c1[0] * (1 - ratio) + c2[0] * ratio)
-        g = int(c1[1] * (1 - ratio) + c2[1] * ratio)
-        b = int(c1[2] * (1 - ratio) + c2[2] * ratio)
-        draw.line([(0, y), (VIDEO_WIDTH, y)], fill=(r, g, b))
-
-    draw.ellipse([(-100, 200), (400, 700)], outline=accent, width=4)
-    draw.ellipse([(600, 1200), (1200, 1800)], outline=accent, width=6)
-    draw.line([(100, 1000), (980, 1000)], fill=(255, 255, 255, 100), width=2)
-
-    try:
-        font_large = ImageFont.truetype("arial.ttf", 60)
-        font_sub = ImageFont.truetype("arial.ttf", 40)
-    except Exception:
-        font_large = ImageFont.load_default()
-        font_sub = ImageFont.load_default()
-
-    draw.rectangle([(100, 300), (980, 420)], fill=accent)
-    draw.text((VIDEO_WIDTH // 2, 360), f"FACT #{scene_index}", fill=(255, 255, 255), font=font_large, anchor="mm")
-    draw.text((VIDEO_WIDTH // 2, 550), keywords.upper(), fill=(255, 255, 255), font=font_sub, anchor="mm")
-
-    img.save(out_path)
-    logger.info(f"Generated procedural visual graphic for scene {scene_index}")
-    return str(out_path)
-
-def prepare_scene_media(script_data: dict, topic: str) -> list:
-    scenes = script_data.get("scenes", [])
-    media_list = []
-    logger.info("Preparing scene visuals...")
-
-    for i, scene in enumerate(scenes, start=1):
-        kw = scene.get("search_keywords", topic)
-        script_part = scene.get("script_part", "")
-        media_path = fetch_pexels_media(kw, i)
-        if not media_path:
-            media_path = generate_procedural_graphic(i, topic, kw, script_part)
-
-        media_list.append({
-            "scene_number": i,
-            "media_path": media_path,
-            "script_part": script_part
-        })
-    return media_list
-
-
-# ==============================================================================
-# 8. SUBTITLE ANIMATOR (MRBEAST STYLE KARAOKE HIGHLIGHT)
-# ==============================================================================
-def format_ass_time(seconds: float) -> str:
-    millis = int((seconds - int(seconds)) * 100)
-    total_seconds = int(seconds)
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    secs = total_seconds % 60
-    return f"{hours:d}:{minutes:02d}:{secs:02d}.{millis:02d}"
-
-def generate_mrbeast_ass_subtitles(audio_path: str, script_data: dict, total_duration: float, ass_path: Path, voiceover_info: dict = None):
-    sections = []
-    if voiceover_info and "sections" in voiceover_info:
-        sections = voiceover_info["sections"]
-
-    if not sections:
-        full_text = script_data.get("full_narration", "")
-        sections = [{"text": full_text, "duration": total_duration, "pause_after": 0.0}]
-
-    word_events = []
-    curr_time = 0.0
-
-    for sec in sections:
-        sec_text = sec.get("text", "").strip()
-        sec_dur = sec.get("duration", 0.0)
-        pause_after = sec.get("pause_after", 0.0)
-
-        # Exact words spoken by the voiceover in pure Hindi Devanagari
-        raw_words = [w.strip() for w in sec_text.split() if w.strip()]
-        if not raw_words:
-            curr_time += sec_dur + pause_after
-            continue
-
-        # Proportional syllable/character timing for exact voice match
-        total_chars = sum(max(1, len(w)) for w in raw_words)
-        for w in raw_words:
-            w_dur = (max(1, len(w)) / total_chars) * sec_dur
-            word_events.append({
-                "word": w,
-                "start": curr_time,
-                "end": curr_time + w_dur
-            })
-            curr_time += w_dur
-
-        # Micro-pause silence (no captions during pauses)
-        curr_time += pause_after
-
-    if not word_events:
-        word_events = [{"word": "रोचक तथ्य", "start": 0.0, "end": total_duration}]
-
-    # Group into phrases of 2-3 words for high readability and viral pacing
-    phrase_group_size = 3
-    phrases = []
-    for i in range(0, len(word_events), phrase_group_size):
-        phrases.append(word_events[i:i+phrase_group_size])
-
-    header = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        "PlayResX: 1080\n"
-        "PlayResY: 1920\n"
-        "ScaledBorderAndShadow: yes\n\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: MrBeast,Nirmala UI,56,&H00FFFFFF,&H00000000,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,5,3,2,40,40,260,1\n\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    return concatenate_audioclips(
+        pieces
     )
 
-    ass_dialogues = []
-    for phrase in phrases:
-        phrase_end = phrase[-1]["end"]
 
-        for active_idx in range(len(phrase)):
-            seg_start = phrase[active_idx]["start"]
-            seg_end = phrase[active_idx + 1]["start"] if active_idx + 1 < len(phrase) else phrase_end
-            if seg_end <= seg_start:
-                seg_end = seg_start + 0.15
+def create_sfx_layer(
+    sfx_name,
+    duration,
+    narration,
+    reason,
+    emotion,
+    reaction,
+):
 
-            start_ts = format_ass_time(seg_start)
-            end_ts = format_ass_time(seg_end)
+    available = get_available_sfx()
 
-            formatted_words = []
-            for idx, w_item in enumerate(phrase):
-                w_str = w_item["word"]
-                if idx == active_idx:
-                    # Animated Pop-in scale bounce (125% -> 100%) + Glowing Gold/Yellow highlight
-                    formatted_words.append(f"{{\\fscx125\\fscy125\\t(0,110,\\fscx100\\fscy100)\\c&H0000FFFF&}}{w_str}{{\\r\\c&H00FFFFFF&}}")
-                else:
-                    formatted_words.append(f"{{\\c&H00FFFFFF&}}{w_str}")
+    if not available:
 
-            line_text = " ".join(formatted_words)
-            ass_dialogues.append(f"Dialogue: 0,{start_ts},{end_ts},MrBeast,,0,0,0,,{line_text}")
+        print(
+            "⚠️ No SFX files found in sfx folder."
+        )
 
-    with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(header + "\n".join(ass_dialogues))
-    logger.info(f"Generated {len(ass_dialogues)} Animated Voice-Matched Hindi Captions in: {ass_path}")
+        return None
+
+    requested = str(
+        sfx_name or ""
+    ).lower().strip()
+
+    # If AI-selected SFX does not exist,
+    # intelligently choose another available one.
+    if requested not in available:
+
+        requested = choose_sfx_from_story(
+            narration,
+            reason,
+            emotion,
+            reaction,
+            "",
+        )
+
+    if requested not in available:
+
+        requested = random.choice(
+            available
+        )
+
+    sfx_file = load_sfx(
+        requested
+    )
+
+    if not sfx_file:
+        return None
+
+    try:
+
+        sfx = AudioFileClip(
+            sfx_file
+        )
+
+        if sfx.duration <= 0:
+
+            sfx.close()
+
+            return None
+
+        sfx_duration = min(
+            sfx.duration,
+            MAX_SFX_DURATION,
+            duration,
+        )
+
+        sfx = sfx.subclipped(
+            0,
+            sfx_duration,
+        )
+
+        intensity = get_sfx_intensity(
+            requested,
+            narration,
+            reason,
+            emotion,
+            reaction,
+        )
+
+        volume = (
+            SFX_BASE_VOLUME
+            * intensity
+        )
+
+        # Keep within reasonable range.
+        volume = max(
+            0.40,
+            min(
+                1.0,
+                volume,
+            ),
+        )
+
+        sfx = sfx.with_volume_scaled(
+            volume
+        )
+
+        # Start SFX almost immediately.
+        # This makes hook/reveal effects audible.
+        sfx = sfx.with_start(
+            0.02
+        )
+
+        print(
+            f"💥 SFX: {requested} | "
+            f"volume={volume:.2f} | "
+            f"reason={reason or 'story reaction'}"
+        )
+
+        return sfx
+
+    except Exception as e:
+
+        print(
+            f"⚠️ SFX creation failed "
+            f"({requested}):",
+            e,
+        )
+
+        return None
 
 
-# ==============================================================================
-# 9. VIDEO CREATOR (FFMPEG ASSEMBLY)
-# ==============================================================================
-def render_video(script_data: dict, media_list: list, voiceover_info: dict, topic_dict: dict) -> str:
-    topic = topic_dict.get("topic", "fact")
-    audio_path = voiceover_info.get("audio_path")
-    duration = voiceover_info.get("duration", 30.0)
+# ============================================================
+# MRBEAST DYNAMIC ANIMATED CAPTIONS (WHISPER POWERED)
+# ============================================================
 
-    category_slug = re.sub(r'[^\w]', '', topic_dict.get("category", "fact").lower())
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_filename = f"hindi_{category_slug}_{timestamp}.mp4"
-    final_output_path = VIDEOS_DIR / out_filename
+def get_whisper_word_timestamps(audio_path, narration_text=""):
+    """Extracts sub-second word level timestamps using Groq Whisper API with smart fallback."""
+    if not os.path.exists(audio_path):
+        return []
+    
+    try:
+        with open(audio_path, "rb") as f:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(os.path.basename(audio_path), f.read()),
+                model="whisper-large-v3",
+                response_format="verbose_json",
+                timestamp_granularities=["word"],
+            )
+        
+        words_data = getattr(transcription, "words", None)
+        if isinstance(transcription, dict):
+            words_data = transcription.get("words", [])
+            
+        if words_data and len(words_data) > 0:
+            parsed_words = []
+            for item in words_data:
+                w = item.get("word", "").strip()
+                s = float(item.get("start", 0.0))
+                e = float(item.get("end", s + 0.3))
+                if w:
+                    parsed_words.append({"word": w, "start": s, "end": e})
+            if parsed_words:
+                print(f"🎯 Whisper extracted {len(parsed_words)} word-level timestamps successfully.")
+                return parsed_words
+    except Exception as err:
+        print(f"⚠️ Whisper timestamp extraction warning: {err}")
+        
+    # Fallback timestamp estimation if Whisper unavailable
+    words = re.findall(r'\S+', narration_text) if narration_text else []
+    if not words:
+        return []
+        
+    try:
+        clip = AudioFileClip(audio_path)
+        total_dur = clip.duration
+        clip.close()
+    except Exception:
+        total_dur = len(words) * 0.4
+        
+    avg_dur = total_dur / max(len(words), 1)
+    fallback_words = []
+    current_time = 0.0
+    for w in words:
+        w_dur = max(0.2, avg_dur)
+        fallback_words.append({"word": w, "start": round(current_time, 2), "end": round(current_time + w_dur, 2)})
+        current_time += w_dur
+    return fallback_words
 
-    logger.info(f"Rendering 1080x1920 30FPS vertical video: {out_filename}...")
 
-    ass_path = TEMP_DIR / "captions.ass"
-    generate_mrbeast_ass_subtitles(audio_path, script_data, duration, ass_path, voiceover_info)
+# ============================================================
+# CONTEXT-DRIVEN DYNAMIC EMOJI MATCHER & KINETIC CAPTIONS
+# ============================================================
 
-    num_scenes = len(media_list)
-    scene_duration = duration / num_scenes if num_scenes > 0 else duration
+CONTEXT_EMOJI_MAP = {
+    ("किला", "महल", "मंदिर", "इमारत", "मीनार", "मस्जिद", "भवन", "fort", "castle", "palace", "temple", "monument", "building", "kila", "mahal", "mandir"): "🏛️",
+    ("भूत", "साया", "आत्मा", "श्राप", "मौत", "कंकाल", "लाश", "डरावना", "खौफ", "हॉन्टेड", "ghost", "haunted", "curse", "death", "skeleton", "scary", "bhoot", "aatma", "shraap", "maut"): "💀",
+    ("रहस्य", "गुप्त", "छुपा", "पहेली", "अनसुलझा", "mystery", "secret", "hidden", "unexplained", "puzzle", "rahasya", "gupt", "chupa"): "🕵️",
+    ("खजाना", "सोना", "पैसा", "धन", "दौलत", "हीरा", "जवाहरात", "treasure", "gold", "money", "rich", "diamond", "khazana", "sona", "paisa"): "💰",
+    ("आग", "अग्नि", "धमाका", "ज्वाला", "fire", "burn", "flame", "explosion", "aag"): "🔥",
+    ("समुद्र", "नदी", "झील", "पानी", "सागर", "बारिश", "sea", "ocean", "river", "lake", "water", "rain", "samudra", "nadi", "paani"): "🌊",
+    ("युद्ध", "सेना", "लड़ाई", "तलवार", "हमला", "सिपाही", "जंग", "war", "fight", "sword", "army", "battle", "attack", "yuddh", "sena", "ladai", "talwar"): "⚔️",
+    ("राजा", "रानी", "सम्राट", "बादशाह", "शाही", "ताज", "king", "queen", "royal", "crown", "emperor", "raja", "rani", "badshah"): "👑",
+    ("खतरा", "सावधान", "ज़हर", "विष", "वार्निंग", "danger", "warning", "toxic", "poison", "alert", "khatra", "zahar"): "⚠️",
+    ("सांप", "नाग", "सर्प", "snake", "cobra", "saamp", "naag"): "🐍",
+    ("रात", "अंधेरा", "छाया", "चांद", "night", "dark", "shadow", "moon", "raat", "andhera"): "🌙",
+    ("आंख", "आंखें", "नज़र", "देखना", "eye", "eyes", "watch", "look", "see", "aankh", "nazar"): "👁️",
+    ("इतिहास", "प्राचीन", "पुराना", "सदियों", "समय", "काल", "history", "ancient", "old", "century", "time", "itihas", "prachin", "purana"): "⏳",
+    ("दरवाजा", "गुफा", "सुरंग", "द्वार", "gate", "door", "tunnel", "cave", "darwaza", "gufa", "surang"): "🚪",
+    ("सूरज", "रोशनी", "तारा", "चमक", "प्रकाश", "sun", "light", "star", "glow", "suraj", "roshni"): "☀️",
+    ("दिल", "खून", "रक्त", "प्यार", "heart", "blood", "love", "dil", "khoon"): "🩸",
+    ("आवाज़", "चीख", "शोर", "ध्वनि", "voice", "scream", "sound", "noise", "aawaaz", "cheokh"): "🗣️",
+}
 
-    bgm_path = BASE_DIR / "bgm.mp3"
-    whoosh_path = BASE_DIR / "sfx" / "whoosh.mp3"
-    impact_path = BASE_DIR / "sfx" / "impact.mp3"
+
+def get_context_emoji_for_text(text):
+    """Analyzes exact spoken phrase/words and returns matching topic emoji, else None."""
+    if not text:
+        return None
+    text_lower = text.lower()
+    for keyword_tuple, emoji in CONTEXT_EMOJI_MAP.items():
+        for kw in keyword_tuple:
+            if kw in text_lower:
+                return emoji
+    return None
+
+
+def find_emoji_font():
+    """Finds Segoe UI Emoji font on Windows for crisp emoji rendering."""
+    emoji_fonts = [
+        "C:/Windows/Fonts/seguiemj.ttf",
+        "C:/Windows/Fonts/Segoe UI Emoji.ttf",
+    ]
+    for font in emoji_fonts:
+        if os.path.exists(font):
+            return font
+    return None
+
+
+def render_caption_frame(chunk_words, active_word_index, emoji=None, width=1080, height=1920):
+    """Renders Hormozi/TikTok kinetic caption with scale-bounce active word & dynamic floating emoji badge."""
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    font_path = find_font()
+    emoji_font_path = find_emoji_font()
+    
+    font_main = ImageFont.truetype(font_path, 66)
+    font_active = ImageFont.truetype(font_path, 80) # +14px kinetic scale bounce
+
+    if emoji_font_path:
+        font_emoji = ImageFont.truetype(emoji_font_path, 60)
+    else:
+        font_emoji = font_main
+
+    center_x = width // 2
+    center_y = int(height * 0.76)
+    
+    word_boxes = []
+    total_w = 0
+    space_w = 22
+    
+    for i, w_info in enumerate(chunk_words):
+        is_active = (i == active_word_index)
+        f = font_active if is_active else font_main
+        bbox = draw.textbbox((0, 0), w_info['word'], font=f)
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        word_boxes.append({'word': w_info['word'], 'width': w, 'height': h, 'font': f, 'active': is_active})
+        total_w += w + space_w
+    total_w -= space_w
+    
+    start_x = center_x - (total_w // 2)
+    current_x = start_x
+    
+    # Outer dark rounded pill container for 100% legibility over any background
+    pad_x, pad_y = 35, 22
+    max_h = max([wb['height'] for wb in word_boxes]) if word_boxes else 65
+    badge_rect = [
+        start_x - pad_x,
+        center_y - pad_y,
+        start_x + total_w + pad_x,
+        center_y + max_h + pad_y + 12
+    ]
+    draw.rounded_rectangle(badge_rect, radius=30, fill=(0, 0, 0, 205), outline=(255, 255, 255, 140), width=3)
+    
+    # Floating Context Emoji Badge (if spoken phrase matches a topic concept)
+    if emoji:
+        e_bbox = draw.textbbox((0, 0), emoji, font=font_emoji)
+        e_w = e_bbox[2] - e_bbox[0]
+        e_h = e_bbox[3] - e_bbox[1]
+        e_center_x = center_x
+        e_center_y = center_y - 75
+        e_pad = 14
+        e_badge_rect = [
+            e_center_x - (e_w // 2) - e_pad,
+            e_center_y - (e_h // 2) - e_pad,
+            e_center_x + (e_w // 2) + e_pad,
+            e_center_y + (e_h // 2) + e_pad
+        ]
+        draw.rounded_rectangle(e_badge_rect, radius=20, fill=(20, 20, 30, 230), outline=(255, 230, 0, 220), width=3)
+        try:
+            draw.text((e_center_x - (e_w // 2), e_center_y - (e_h // 2) - 4), emoji, font=font_emoji, embedded_color=True)
+        except Exception:
+            draw.text((e_center_x - (e_w // 2), e_center_y - (e_h // 2) - 4), emoji, font=font_emoji, fill=(255, 255, 255, 255))
+
+    # Render Words
+    for wb in word_boxes:
+        word = wb['word']
+        f = wb['font']
+        is_act = wb['active']
+        
+        # 3D Depth Shadow offset layers
+        for offset in [(5, 5), (4, 4), (3, 3), (2, 2)]:
+            draw.text((current_x + offset[0], center_y + offset[1]), word, font=f, fill=(0, 0, 0, 255), stroke_width=5, stroke_fill=(0, 0, 0, 255))
+            
+        if is_act:
+            # Active word - Glowing Neon Yellow background pill & Scale Bounce
+            act_pad_x, act_pad_y = 16, 8
+            act_rect = [current_x - act_pad_x, center_y - act_pad_y, current_x + wb['width'] + act_pad_x, center_y + wb['height'] + act_pad_y + 4]
+            draw.rounded_rectangle(act_rect, radius=20, fill=(255, 230, 0, 250), outline=(255, 255, 255, 255), width=3)
+            # Active text in deep black for high contrast inside yellow pill
+            draw.text((current_x, center_y - 4), word, font=f, fill=(0, 0, 0, 255), stroke_width=2, stroke_fill=(255, 255, 255, 240))
+        else:
+            # Non-active word - Bright White with thick dark stroke
+            draw.text((current_x, center_y), word, font=f, fill=(255, 255, 255, 255), stroke_width=7, stroke_fill=(0, 0, 0, 255))
+            
+        current_x += wb['width'] + space_w
+        
+    return np.array(img)
+
+
+def create_mrbeast_caption_clip(audio_path, narration_text, duration):
+    """Creates a transparent VideoClip with kinetic subtitles & context emojis synced to Whisper timestamps."""
+    words = get_whisper_word_timestamps(audio_path, narration_text)
+    if not words:
+        return None
+        
+    # Group words into 3-word kinetic display chunks
+    chunks = []
+    chunk_size = 3
+    for i in range(0, len(words), chunk_size):
+        group = words[i:i+chunk_size]
+        start_t = group[0]['start']
+        end_t = group[-1]['end']
+        
+        # Analyze exact phrase spoken in this chunk for dynamic context emoji matching
+        chunk_text = " ".join([w['word'] for w in group])
+        chunk_emoji = get_context_emoji_for_text(chunk_text)
+        if not chunk_emoji and narration_text:
+            chunk_emoji = get_context_emoji_for_text(narration_text)
+            
+        chunks.append({
+            'words': group,
+            'start': start_t,
+            'end': end_t,
+            'emoji': chunk_emoji
+        })
+        
+    def make_frame(t):
+        active_chunk = None
+        for ch in chunks:
+            if ch['start'] <= t <= ch['end'] + 0.3:
+                active_chunk = ch
+                break
+        if not active_chunk and chunks:
+            active_chunk = min(chunks, key=lambda c: abs(c['start'] - t))
+            if abs(active_chunk['start'] - t) > 1.0:
+                active_chunk = None
+                
+        if not active_chunk:
+            return np.zeros((VIDEO_HEIGHT, VIDEO_WIDTH, 4), dtype=np.uint8)
+            
+        active_idx = -1
+        for idx, w in enumerate(active_chunk['words']):
+            if w['start'] <= t <= w['end']:
+                active_idx = idx
+                break
+        if active_idx == -1:
+            active_idx = 0
+            
+        return render_caption_frame(active_chunk['words'], active_idx, emoji=active_chunk.get('emoji'), width=VIDEO_WIDTH, height=VIDEO_HEIGHT)
+        
+    try:
+        caption_clip = VideoClip(make_frame, duration=duration)
+        return caption_clip
+    except Exception as e:
+        print(f"⚠️ Caption clip creation failed: {e}")
+        return None
+
+
+# ============================================================
+# BUILD SCENE
+# ============================================================
+
+def build_scene(
+    video_path,
+    audio_path,
+    scene_number,
+    sfx_name=None,
+    sfx_reason="",
+    emotion="",
+    reaction="",
+    narration="",
+):
+
+    print(
+        f"\n🎬 Building scene {scene_number} with MrBeast Captions & Anti-Reused FX"
+    )
+
+    narration_audio = None
+    source_video = None
+
+    try:
+
+        narration_audio = AudioFileClip(
+            audio_path
+        )
+
+        duration = narration_audio.duration
+
+        if duration <= 0:
+
+            raise RuntimeError(
+                f"Scene {scene_number} "
+                "voice duration is invalid."
+            )
+
+        source_video = VideoFileClip(
+            video_path
+        )
+
+        if source_video.duration <= 0:
+
+            raise RuntimeError(
+                f"Scene {scene_number} "
+                "source video duration is invalid."
+            )
+
+        if source_video.duration < duration:
+
+            loops = (
+                int(
+                    duration
+                    / max(
+                        source_video.duration,
+                        0.1,
+                    )
+                )
+                + 1
+            )
+
+            video = concatenate_videoclips(
+                [source_video] * loops,
+                method="compose",
+            )
+
+        else:
+
+            video = source_video
+
+        video = video.subclipped(
+            0,
+            min(
+                duration,
+                video.duration,
+            ),
+        )
+
+        rapid_segments = (
+            create_rapid_segments(
+                video,
+                duration,
+            )
+        )
+
+        if rapid_segments:
+
+            video = concatenate_videoclips(
+                rapid_segments,
+                method="compose",
+            )
+
+            video = video.subclipped(
+                0,
+                min(
+                    duration,
+                    video.duration,
+                ),
+            )
+
+        else:
+
+            video = prepare_clip_for_shorts(
+                video
+            )
+
+        # ----------------------------------------------------
+        # Anti-Reused Content: Dynamic Ken Burns Zoom Transformation
+        # ----------------------------------------------------
+        try:
+            video = video.resized(lambda t: 1.0 + 0.04 * (t / max(duration, 0.1)))
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # SFX Layer
+        # ----------------------------------------------------
+
+        audio_layers = [
+            narration_audio
+        ]
+
+        sfx = create_sfx_layer(
+            sfx_name=sfx_name,
+            duration=duration,
+            narration=narration,
+            reason=sfx_reason,
+            emotion=emotion,
+            reaction=reaction,
+        )
+
+        if sfx:
+
+            audio_layers.append(
+                sfx
+            )
+
+        else:
+
+            print(
+                f"⚠️ Scene {scene_number}: "
+                "SFX unavailable."
+            )
+
+        combined_audio = (
+            CompositeAudioClip(
+                audio_layers
+            )
+        )
+
+        # ----------------------------------------------------
+        # MrBeast 3D Dynamic Animated Captions Overlay
+        # ----------------------------------------------------
+        caption_clip = create_mrbeast_caption_clip(audio_path, narration, duration)
+        
+        video_layers = [video]
+        if caption_clip is not None:
+            video_layers.append(caption_clip)
+
+        final_scene = CompositeVideoClip(
+            video_layers,
+            size=(
+                VIDEO_WIDTH,
+                VIDEO_HEIGHT,
+            ),
+        )
+
+        final_scene = final_scene.with_audio(
+            combined_audio
+        )
+
+        return final_scene
+
+    except Exception:
+
+        try:
+
+            if narration_audio:
+                narration_audio.close()
+
+        except Exception:
+            pass
+
+        try:
+
+            if source_video:
+                source_video.close()
+
+        except Exception:
+            pass
+
+        raise
+
+
+# ============================================================
+# BGM
+# ============================================================
+
+def add_background_music(
+    final_video
+):
+
+    if not BGM_FILE.exists():
+
+        print(
+            "⚠️ bgm.mp3 not found."
+        )
+
+        return final_video
+
+    print(
+        "🎵 Adding suspense BGM..."
+    )
+
+    bgm = None
+
+    try:
+
+        bgm = AudioFileClip(
+            str(BGM_FILE)
+        )
+
+        bgm = make_looped_audio(
+            bgm,
+            final_video.duration,
+        )
+
+        bgm = bgm.with_volume_scaled(
+            BGM_VOLUME
+        )
+
+        if final_video.audio:
+
+            audio = CompositeAudioClip(
+                [
+                    final_video.audio,
+                    bgm,
+                ]
+            )
+
+        else:
+
+            audio = bgm
+
+        return final_video.with_audio(
+            audio
+        )
+
+    except Exception as e:
+
+        print(
+            "⚠️ BGM failed:",
+            e,
+        )
+
+        try:
+
+            if bgm:
+                bgm.close()
+
+        except Exception:
+            pass
+
+        return final_video
+
+
+# ============================================================
+# THUMBNAIL
+# ============================================================
+
+FONT_CACHE_DIR = Path("fonts")
+FONT_CACHE_DIR.mkdir(exist_ok=True)
+LOCAL_NOTO_FONT = FONT_CACHE_DIR / "NotoSansDevanagari-Bold.ttf"
+
+def download_devanagari_font():
+    """Downloads NotoSansDevanagari-Bold.ttf as a guaranteed Devanagari fallback font if system font is unavailable."""
+    if LOCAL_NOTO_FONT.exists() and LOCAL_NOTO_FONT.stat().st_size > 10000:
+        return str(LOCAL_NOTO_FONT.resolve())
+    try:
+        url = "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Bold.ttf"
+        print("⏬ Downloading Devanagari font (NotoSansDevanagari-Bold.ttf)...")
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200 and len(r.content) > 10000:
+            with open(LOCAL_NOTO_FONT, "wb") as f:
+                f.write(r.content)
+            print("✅ Devanagari font downloaded successfully.")
+            return str(LOCAL_NOTO_FONT.resolve())
+    except Exception as e:
+        print(f"⚠️ Font download exception: {e}")
+    return None
+
+def find_font():
+    """Finds a valid TrueType Devanagari font for Hindi caption rendering. Never returns load_default bitmap font."""
+    fonts = [
+        "C:/Windows/Fonts/Nirmala.ttf",        # Nirmala UI Regular
+        "C:/Windows/Fonts/NirmalaB.ttf",       # Nirmala UI Bold
+        "C:/Windows/Fonts/mangal.ttf",         # Mangal
+        "C:/Windows/Fonts/aparaj.ttf",        # Aparajita
+        str(LOCAL_NOTO_FONT.resolve()),
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Bold.ttf",
+    ]
+    for font_path in fonts:
+        if os.path.exists(font_path) and os.path.getsize(font_path) > 10000:
+            return font_path
+
+    # Auto-download NotoSansDevanagari if no local font matched
+    downloaded_font = download_devanagari_font()
+    if downloaded_font:
+        return downloaded_font
+
+    raise RuntimeError("❌ No Devanagari font found on system and auto-download failed. Please ensure Nirmala.ttf or NotoSansDevanagari font is installed.")
+
+
+def create_thumbnail(
+    video_path,
+    title,
+):
+
+    print(
+        "\n🖼️ Creating thumbnail..."
+    )
+
+    video = VideoFileClip(
+        video_path
+    )
+
+    try:
+
+        frame_time = min(
+            1.5,
+            max(
+                0,
+                video.duration - 0.1,
+            ),
+        )
+
+        frame = video.get_frame(
+            frame_time
+        )
+
+        image = (
+            Image.fromarray(frame)
+            .convert("RGB")
+            .resize(
+                (
+                    1280,
+                    720,
+                )
+            )
+            .filter(
+                ImageFilter.SHARPEN
+            )
+        )
+
+        draw = ImageDraw.Draw(
+            image
+        )
+
+        font_path = find_font()
+        font = ImageFont.truetype(
+            font_path,
+            72,
+        )
+
+        words = str(
+            title
+        ).split()
+
+        if len(words) > 6:
+
+            words = words[:6]
+
+        thumbnail_text = " ".join(
+            words
+        )
+
+        bbox = draw.textbbox(
+            (0, 0),
+            thumbnail_text,
+            font=font,
+        )
+
+        text_width = (
+            bbox[2]
+            - bbox[0]
+        )
+
+        x = (
+            1280
+            - text_width
+        ) // 2
+
+        y = 530
+
+        padding = 22
+
+        draw.rounded_rectangle(
+            (
+                x - padding,
+                y - padding,
+                x + text_width + padding,
+                y + 100,
+            ),
+            radius=20,
+            fill=(0, 0, 0, 190),
+        )
+
+        draw.text(
+            (
+                x,
+                y,
+            ),
+            thumbnail_text,
+            font=font,
+            fill="white",
+            stroke_width=7,
+            stroke_fill="black",
+        )
+
+        output = (
+            THUMBNAIL_DIR
+            / "mystery_thumbnail.jpg"
+        )
+
+        image.save(
+            output,
+            quality=95,
+        )
+
+        print(
+            "✅ Thumbnail:",
+            output,
+        )
+
+        return str(output)
+
+    finally:
+
+        video.close()
+
+
+# ============================================================
+# VIDEO VALIDATION
+# ============================================================
+
+def validate_completed_video(
+    video_path,
+    expected_scene_count=7,
+):
+
+    print(
+        "\n🔍 VALIDATING COMPLETED VIDEO..."
+    )
+
+    path = Path(
+        video_path
+    )
+
+    if not path.exists():
+
+        raise RuntimeError(
+            "Final video file does not exist."
+        )
+
+    if path.stat().st_size < 100_000:
+
+        raise RuntimeError(
+            "Final video file is suspiciously small."
+        )
+
+    video = None
+
+    try:
+
+        video = VideoFileClip(
+            str(path)
+        )
+
+        duration = float(
+            video.duration or 0
+        )
+
+        if duration <= 0:
+
+            raise RuntimeError(
+                "Final video duration is invalid."
+            )
+
+        if video.w != VIDEO_WIDTH:
+            raise RuntimeError(
+                f"Invalid video width: {video.w}"
+            )
+
+        if video.h != VIDEO_HEIGHT:
+            raise RuntimeError(
+                f"Invalid video height: {video.h}"
+            )
+
+        if duration < 5:
+
+            raise RuntimeError(
+                "Final video is too short."
+            )
+
+        if duration > (
+            MAX_SHORT_DURATION + 0.5
+        ):
+
+            raise RuntimeError(
+                "Final video exceeds maximum duration."
+            )
+
+        print(
+            f"✅ Video validation passed: "
+            f"{video.w}x{video.h}, "
+            f"{duration:.2f}s"
+        )
+
+        return True
+
+    finally:
+
+        if video:
+
+            try:
+                video.close()
+
+            except Exception:
+                pass
+
+
+# ============================================================
+# ASSEMBLE FULL SHORT
+# ============================================================
+
+def assemble_video(
+    story
+):
+
+    print(
+        "\n"
+        + "=" * 75
+    )
+
+    print(
+        "🎞️ BUILDING HIGH-RETENTION SHORT"
+    )
+
+    print(
+        "=" * 75
+    )
+
+    scenes = story.get(
+        "scenes",
+        [],
+    )
+
+    # --------------------------------------------------------
+    # HARD REQUIREMENT: exactly 7 scenes.
+    # --------------------------------------------------------
+
+    if len(scenes) != 7:
+
+        raise RuntimeError(
+            f"❌ Cannot build video. "
+            f"Expected 7 scenes, got {len(scenes)}."
+        )
 
     scene_clips = []
-    for idx, item in enumerate(media_list, start=1):
-        m_path = item.get("media_path")
-        clip_out = TEMP_DIR / f"clip_{idx}.mp4"
-        is_image = str(m_path).lower().endswith((".jpg", ".png", ".jpeg"))
-        loop_args = ["-loop", "1"] if is_image else ["-stream_loop", "-1"]
-        vf_filter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,eq=contrast=1.06:saturation=1.12"
 
-        ffmpeg_clip_cmd = [
-            "ffmpeg", "-y"
-        ] + loop_args + [
-            "-i", str(m_path),
-            "-t", f"{scene_duration:.2f}",
-            "-vf", vf_filter,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-            str(clip_out)
-        ]
+    created_scene_numbers = set()
+
+    try:
+
+        for scene in scenes:
+
+            number = int(
+                scene.get(
+                    "scene_number"
+                )
+            )
+
+            if number in created_scene_numbers:
+
+                raise RuntimeError(
+                    f"Duplicate scene number: {number}"
+                )
+
+            query = scene.get(
+                "pexels_query",
+                "",
+            )
+
+            narration = scene.get(
+                "narration",
+                "",
+            )
+
+            sfx = scene.get(
+                "sfx"
+            )
+
+            sfx_reason = scene.get(
+                "sfx_reason",
+                "",
+            )
+
+            emotion = scene.get(
+                "emotion",
+                "",
+            )
+
+            reaction = scene.get(
+                "reaction",
+                "",
+            )
+
+            print(
+                f"\n🎥 SCENE {number}"
+            )
+
+            if number == 1:
+
+                print(
+                    "🔥 0-3 SEC "
+                    "EXTREMELY STRONG HOOK"
+                )
+
+            print(
+                "Visual:",
+                query,
+            )
+
+            print(
+                "Narration:",
+                narration,
+            )
+
+            print(
+                "SFX:",
+                sfx,
+            )
+
+            print(
+                "SFX reason:",
+                sfx_reason,
+            )
+
+            # ------------------------------------------------
+            # NEVER SKIP A SCENE.
+            #
+            # If original footage unavailable, try fallback
+            # queries. If all fail, abort complete video.
+            # ------------------------------------------------
+
+            video_file = (
+                get_related_scene_video(
+                    scene_number=number,
+                    query=query,
+                    narration=narration,
+                    topic=story.get(
+                        "topic",
+                        "",
+                    ),
+                )
+            )
+
+            if not video_file:
+
+                raise RuntimeError(
+                    f"❌ Scene {number} "
+                    "could not obtain any related "
+                    "Indian footage."
+                )
+
+            audio_file = generate_voice(
+                narration,
+                number,
+            )
+
+            clip = build_scene(
+                video_file,
+                audio_file,
+                number,
+                sfx,
+                sfx_reason,
+                emotion,
+                reaction,
+                narration,
+            )
+
+            if clip is None:
+
+                raise RuntimeError(
+                    f"Scene {number} "
+                    "clip creation failed."
+                )
+
+            scene_clips.append(
+                clip
+            )
+
+            created_scene_numbers.add(
+                number
+            )
+
+            print(
+                f"✅ Scene {number}/7 completed."
+            )
+
+        # ----------------------------------------------------
+        # HARD REQUIREMENT: all seven scenes.
+        # ----------------------------------------------------
+
+        if len(scene_clips) != 7:
+
+            raise RuntimeError(
+                "❌ Video assembly aborted: "
+                f"only {len(scene_clips)}/7 scenes completed."
+            )
+
+        if created_scene_numbers != {
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+        }:
+
+            raise RuntimeError(
+                "❌ Scene validation failed. "
+                "All scene numbers 1-7 are required."
+            )
+
+        print(
+            "\n🔗 Joining all 7 scenes..."
+        )
+
+        final_video = (
+            concatenate_videoclips(
+                scene_clips,
+                method="compose",
+            )
+        )
+
+        final_video = (
+            add_background_music(
+                final_video
+            )
+        )
+
+        if (
+            final_video.duration
+            > MAX_SHORT_DURATION
+        ):
+
+            print(
+                f"\n✂️ Final video is "
+                f"{final_video.duration:.2f}s. "
+                f"Trimming to "
+                f"{MAX_SHORT_DURATION:.0f}s..."
+            )
+
+            final_video = (
+                final_video.subclipped(
+                    0,
+                    MAX_SHORT_DURATION,
+                )
+            )
+
+        output = (
+            OUTPUT_DIR
+            / "mystery_short.mp4"
+        )
+
+        # Remove old output before export.
         try:
-            subprocess.run(ffmpeg_clip_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            scene_clips.append(clip_out)
-        except Exception as e:
-            logger.warning(f"Clip render warning for scene {idx}: {e}")
-            fallback_cmd = [
-                "ffmpeg", "-y", "-i", str(m_path), "-t", f"{scene_duration:.2f}",
-                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-                str(clip_out)
-            ]
-            subprocess.run(fallback_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            scene_clips.append(clip_out)
 
-    concat_list_path = TEMP_DIR / "concat_list.txt"
-    with open(concat_list_path, "w", encoding="utf-8") as f:
-        for clip in scene_clips:
-            c_path_str = str(clip).replace("\\", "/")
-            f.write(f"file '{c_path_str}'\n")
+            if output.exists():
+                output.unlink()
 
-    concat_video_path = TEMP_DIR / "concat_raw.mp4"
-    concat_cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(concat_list_path), "-c", "copy",
-        str(concat_video_path)
-    ]
-    subprocess.run(concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-
-    ass_path_str = str(ass_path).replace("\\", "/").replace(":", "\\:")
-    dur_str = f"{duration:.2f}"
-    prog_bar_expr = f"drawbox=x=0:y=1908:w='iw*(t/{dur_str})':h=12:color=0x00E5FF@0.9:t=fill"
-    combined_vf = f"{prog_bar_expr},ass='{ass_path_str}'"
-
-    inputs = ["-i", str(concat_video_path), "-i", str(audio_path)]
-    input_count = 2
-    audio_mix_labels = ["[1:a]volume=1.0[vo]"]
-    mix_inputs = ["[vo]"]
-
-    if bgm_path.exists():
-        inputs.extend(["-i", str(bgm_path)])
-        audio_mix_labels.append(f"[{input_count}:a]volume=0.07[bgm]")
-        mix_inputs.append("[bgm]")
-        input_count += 1
-
-    if whoosh_path.exists():
-        inputs.extend(["-i", str(whoosh_path)])
-        audio_mix_labels.append(f"[{input_count}:a]volume=0.28[sfx_whoosh]")
-        mix_inputs.append("[sfx_whoosh]")
-        input_count += 1
-
-    if impact_path.exists():
-        hook_dur = voiceover_info.get("hook_duration", 3.2)
-        delay_ms = max(500, int(hook_dur * 1000))
-        inputs.extend(["-i", str(impact_path)])
-        audio_mix_labels.append(f"[{input_count}:a]adelay={delay_ms}|{delay_ms},volume=0.42[sfx_impact]")
-        mix_inputs.append("[sfx_impact]")
-        input_count += 1
-
-    mix_count = len(mix_inputs)
-    amix_str = f"{''.join(mix_inputs)}amix=inputs={mix_count}:duration=first[aout]"
-    filter_complex = f"{';'.join(audio_mix_labels)};{amix_str}"
-
-    final_cmd = [
-        "ffmpeg", "-y"
-    ] + inputs + [
-        "-vf", combined_vf,
-        "-filter_complex", filter_complex,
-        "-map", "0:v", "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-        "-c:a", "aac", "-b:a", "192k", "-shortest",
-        str(final_output_path)
-    ]
-
-    logger.info("Rendering final video with progress bar & multi-track audio...")
-    subprocess.run(final_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    logger.info(f"Video rendered successfully! Saved to: {final_output_path}")
-    return str(final_output_path)
-
-
-# ==============================================================================
-# 10. METADATA & THUMBNAIL GENERATOR
-# ==============================================================================
-def generate_thumbnail(topic: str, output_path: Path):
-    img = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), color=(15, 23, 42))
-    draw = ImageDraw.Draw(img)
-
-    for y in range(VIDEO_HEIGHT):
-        r = int(15 + (y / VIDEO_HEIGHT) * 45)
-        g = int(23 + (y / VIDEO_HEIGHT) * 60)
-        b = int(42 + (y / VIDEO_HEIGHT) * 120)
-        draw.line([(0, y), (VIDEO_WIDTH, y)], fill=(r, g, b))
-
-    draw.rectangle([(80, 500), (1000, 700)], fill=(220, 38, 38))
-    
-    font_large = None
-    font_small = None
-    for f_candidate in ["Nirmala.ttc", "segoeuib.ttf", "segoeui.ttf", "arial.ttf"]:
-        try:
-            font_large = ImageFont.truetype(f_candidate, 65)
-            font_small = ImageFont.truetype(f_candidate, 45)
-            break
         except Exception:
-            continue
+            pass
 
-    if not font_large:
-        font_large = ImageFont.load_default()
-        font_small = ImageFont.load_default()
+        print(
+            "\n📤 Exporting:",
+            output,
+        )
 
-    draw.text((VIDEO_WIDTH // 2, 600), "अनोखा सच 🤯", fill=(255, 255, 255), font=font_large, anchor="mm")
+        final_video.write_videofile(
+            str(output),
+            fps=FPS,
+            codec="libx264",
+            audio_codec="aac",
+            preset="medium",
+            bitrate="8M",
+            pixel_format="yuv420p",
+            threads=4,
+            logger="bar",
+        )
 
-    words = topic.split()
-    lines = []
-    curr_line = ""
-    for w in words:
-        if len(curr_line + " " + w) > 18:
-            lines.append(curr_line)
-            curr_line = w
-        else:
-            curr_line += " " + w if curr_line else w
-    if curr_line:
-        lines.append(curr_line)
+        duration = (
+            final_video.duration
+        )
 
-    start_y = 900
-    for line in lines[:4]:
-        draw.text((VIDEO_WIDTH // 2, start_y), line, fill=(255, 255, 0), font=font_small, anchor="mm")
-        start_y += 85
+        final_video.close()
 
-    img.save(output_path, "JPEG", quality=90)
-    logger.info(f"Generated thumbnail image: {output_path}")
+        # ----------------------------------------------------
+        # VERY IMPORTANT:
+        # Validate MP4 BEFORE allowing upload.
+        # ----------------------------------------------------
 
-def generate_metadata(topic_dict: dict, researched_fact: dict, script_data: dict) -> dict:
-    topic = topic_dict.get("topic", "").strip()
-    if "\n" in topic:
-        topic = topic.split("\n")[0].strip()
-    category = topic_dict.get("category", "SCIENCE")
-    main_fact_raw = researched_fact.get("main_fact", "")
-    clean_fact = main_fact_raw.split("\n")[0].strip()[:180]
+        validate_completed_video(
+            output,
+            expected_scene_count=7,
+        )
 
-    logger.info("Generating YouTube SEO Metadata in Hindi...")
-    clean_topic = topic.rstrip("?").rstrip("।").rstrip(".").strip()
-    emoji_map = {
-        "ANIMALS": "🐘", "BIRDS": "🦅", "PLANTS": "🌱", "TREES": "🌲",
-        "HUMAN BODY": "🧠", "HUMANS": "👤", "MARINE LIFE": "🐙",
-        "SPACE": "🌌", "SCIENCE": "🔬", "INSECTS": "🐝", "REPTILES": "🐊"
-    }
-    emoji = emoji_map.get(category.upper(), "✨")
+        print(
+            "\n🎉 COMPLETE 7-SCENE VIDEO CREATED"
+        )
 
-    # Keep title under 50 characters with high suspense and curiosity
-    # Rule: 2-3 core hashtags (#Shorts #HindiFacts #Mystery or category tag)
-    tag_suffix = "#Shorts #HindiFacts #Mystery"
-    max_text_len = 50 - len(tag_suffix) - 4  # leaving room for emoji and space
-    
-    short_text = clean_topic
-    if len(short_text) > max_text_len:
-        short_text = short_text[:max_text_len].rstrip()
-    
-    title = f"{short_text}? {emoji} {tag_suffix}"
-    # Ensure strict ceiling
-    if len(title) > 55:
-        title = f"{short_text[:20]}.. {emoji} #Shorts #HindiFacts"
+        print(
+            "⏱️ Duration:",
+            round(
+                duration,
+                2,
+            ),
+            "seconds",
+        )
 
-    hashtags = ["#Shorts", "#HindiFacts", "#Mystery"]
-    description = (
-        f"क्या आप जानते हैं? {clean_fact}\n\n"
-        f"जानिए {clean_topic} से जुड़े इस चौंकाने वाले सच को 30 सेकंड के अंदर!\n\n"
-        f"हर रोज़ ऐसे ही ज्ञानवर्धक और अनोखे फैक्ट्स के लिए चैनल को सब्सक्राइब करें।\n\n"
-        f"{' '.join(hashtags)}"
+        print(
+            "📁",
+            output,
+        )
+
+        return str(output)
+
+    except Exception:
+
+        # Close all already-created clips.
+        for clip in scene_clips:
+
+            try:
+                clip.close()
+
+            except Exception:
+                pass
+
+        # If failed, remove incomplete output.
+        output = (
+            OUTPUT_DIR
+            / "mystery_short.mp4"
+        )
+
+        try:
+
+            if output.exists():
+                output.unlink()
+
+        except Exception:
+            pass
+
+        raise
+
+    finally:
+
+        for clip in scene_clips:
+
+            try:
+                clip.close()
+
+            except Exception:
+                pass
+
+
+# ============================================================
+# YOUTUBE AUTHENTICATION
+# ============================================================
+
+def get_youtube_service():
+
+    scopes = [
+        YOUTUBE_SCOPE
+    ]
+
+    credentials = None
+
+    # --------------------------------------------------------
+    # 1. Existing token.json
+    # --------------------------------------------------------
+
+    if os.path.exists(
+        TOKEN_FILE
+    ):
+
+        print(
+            "🔐 Loading YouTube token.json..."
+        )
+
+        try:
+
+            credentials = (
+                Credentials.from_authorized_user_file(
+                    TOKEN_FILE,
+                    scopes,
+                )
+            )
+
+        except Exception as e:
+
+            print(
+                "⚠️ token.json could not "
+                "be loaded:",
+                e,
+            )
+
+            credentials = None
+
+    # --------------------------------------------------------
+    # 2. Refresh
+    # --------------------------------------------------------
+
+    if (
+        credentials is not None
+        and credentials.expired
+    ):
+
+        if credentials.refresh_token:
+
+            print(
+                "🔄 Refreshing YouTube "
+                "access token..."
+            )
+
+            try:
+
+                credentials.refresh(
+                    Request()
+                )
+
+                with open(
+                    TOKEN_FILE,
+                    "w",
+                    encoding="utf-8",
+                ) as token:
+
+                    token.write(
+                        credentials.to_json()
+                    )
+
+                print(
+                    "✅ YouTube token refreshed."
+                )
+
+            except Exception as e:
+
+                print(
+                    "⚠️ Token refresh failed:",
+                    e,
+                )
+
+                credentials = None
+
+    # --------------------------------------------------------
+    # 3. Valid token
+    # --------------------------------------------------------
+
+    if (
+        credentials is not None
+        and credentials.valid
+    ):
+
+        print(
+            "✅ YouTube OAuth token is valid."
+        )
+
+        return build(
+            "youtube",
+            "v3",
+            credentials=credentials,
+            cache_discovery=False,
+        )
+
+    # --------------------------------------------------------
+    # 4. client_secret.json
+    # --------------------------------------------------------
+
+    if not CLIENT_SECRET_FILE.exists():
+
+        raise RuntimeError(
+            "\n"
+            "❌ client_secret.json missing.\n\n"
+            "For GitHub Actions, create a GitHub Secret:\n"
+            "CLIENT_SECRET_JSON\n\n"
+            "It must contain the COMPLETE Google OAuth "
+            "client_secret.json contents.\n"
+        )
+
+    # --------------------------------------------------------
+    # 5. Local first OAuth
+    # --------------------------------------------------------
+
+    print(
+        "🔑 Starting YouTube OAuth..."
     )
 
-    base_tags = [
-        "hindi facts", "rochak tathya", "amazing facts in hindi", "science facts hindi",
-        "did you know hindi", "educational shorts hindi", "daily shorts hindi", "facttechz",
-        "unknown facts in hindi", "youtube shorts hindi", category.lower() + " facts hindi"
+    flow = (
+        InstalledAppFlow.from_client_secrets_file(
+            CLIENT_SECRET_FILE,
+            scopes,
+        )
+    )
+
+    if (
+        os.getenv(
+            "GITHUB_ACTIONS",
+            "",
+        ).lower()
+        == "true"
+    ):
+
+        raise RuntimeError(
+            "\n"
+            "❌ YouTube token.json is missing "
+            "or expired in GitHub Actions.\n\n"
+            "Run the script locally once, "
+            "complete Google OAuth, then save "
+            "token.json as YOUTUBE_TOKEN_JSON.\n"
+        )
+
+    credentials = flow.run_local_server(
+        port=0,
+        open_browser=True,
+    )
+
+    with open(
+        TOKEN_FILE,
+        "w",
+        encoding="utf-8",
+    ) as token:
+
+        token.write(
+            credentials.to_json()
+        )
+
+    print(
+        "✅ YouTube token.json created."
+    )
+
+    return build(
+        "youtube",
+        "v3",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+
+# ============================================================
+# YOUTUBE UPLOAD RETRIES
+# ============================================================
+
+def _is_retryable_youtube_error(
+    error
+):
+
+    text = str(
+        error
+    ).lower()
+
+    retry_terms = [
+        "10053",
+        "10054",
+        "10060",
+        "connection aborted",
+        "connection reset",
+        "connection broken",
+        "remote end closed",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "internal error",
+        "backend error",
+        "rate limit",
+        "too many requests",
+        "503",
+        "502",
+        "500",
+        "504",
     ]
-    topic_words = [w.lower() for w in re.findall(r'[\w\u0900-\u097F]+', topic) if len(w) > 2]
-    tags = list(set(base_tags + topic_words))[:15]
 
-    category_slug = re.sub(r'[^\w]', '', category.lower())
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    thumb_path = THUMBNAILS_DIR / f"hindi_{category_slug}_{timestamp}.jpg"
-    generate_thumbnail(topic, thumb_path)
+    if any(
+        term in text
+        for term in retry_terms
+    ):
+        return True
 
-    return {
-        "title": title,
-        "description": description,
-        "tags": tags,
-        "hashtags": hashtags,
-        "thumbnail_path": str(thumb_path)
-    }
+    if isinstance(
+        error,
+        HttpError
+    ):
 
-
-# ==============================================================================
-# 11. SAFETY & QUALITY CHECKER
-# ==============================================================================
-def check_script_safety(script_data: dict) -> bool:
-    narration = script_data.get("full_narration", "").lower()
-    prohibited = ["fake", "cure for cancer in 1 second", "dangerous experiment at home", "illegal", "violence"]
-    for p in prohibited:
-        if p in narration:
-            logger.warning(f"Script safety check failed on prohibited term: '{p}'")
-            return False
-    return True
-
-def validate_video(video_path: str, expected_duration: float = 0.0) -> dict:
-    v_path = Path(video_path)
-    logger.info(f"Quality Control verification on: {v_path.name}")
-
-    if not v_path.exists():
-        logger.error(f"[ERROR] Video file missing: {video_path}")
-        return {"valid": False, "reason": "File missing"}
-
-    file_size = v_path.stat().st_size
-    if file_size < 100000:
-        logger.error(f"[ERROR] Video file size too small: {file_size} bytes")
-        return {"valid": False, "reason": "File size too small"}
-
-    try:
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
-            str(v_path)
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        probe_data = json.loads(result.stdout)
-        streams = probe_data.get("streams", [])
-
-        video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
-        audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
-
-        if not video_stream or not audio_stream:
-            logger.error("[ERROR] Validation failed: Missing video or audio stream.")
-            return {"valid": False, "reason": "Missing stream"}
-
-        width = int(video_stream.get("width", 0))
-        height = int(video_stream.get("height", 0))
-        duration = float(probe_data.get("format", {}).get("duration", 0.0))
-
-        if duration <= 0 or width > height:
-            return {"valid": False, "reason": "Invalid resolution or duration"}
-
-        logger.info(f"Quality Control Passed! ({width}x{height}, {duration:.2f}s, {file_size/1024/1024:.2f}MB)")
-        return {"valid": True, "width": width, "height": height, "duration": duration, "file_size": file_size}
-    except Exception as e:
-        logger.error(f"[ERROR] Quality control probe failed: {e}")
-        return {"valid": False, "reason": str(e)}
-
-
-# ==============================================================================
-# 12. YOUTUBE UPLOADER (OAUTH 2.0 + LOCAL FALLBACK)
-# ==============================================================================
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-
-def find_client_secret() -> Path:
-    candidates = [
-        CREDENTIALS_DIR / "client_secret.json",
-        BASE_DIR / "client_secret.json",
-        Path(YOUTUBE_CLIENT_SECRET)
-    ]
-    for root_file in BASE_DIR.glob("client_secret*.json"):
-        candidates.append(root_file)
-    for cred_file in CREDENTIALS_DIR.glob("client_secret*.json"):
-        candidates.append(cred_file)
-
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
-
-def find_token_file() -> Path:
-    candidates = [
-        CREDENTIALS_DIR / "token.json",
-        BASE_DIR / "token.json",
-        Path(YOUTUBE_TOKEN_FILE)
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return CREDENTIALS_DIR / "token.json"
-
-def get_authenticated_youtube_service():
-    try:
-        from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from google.auth.transport.requests import Request
-    except ImportError:
-        logger.warning("Google API client libraries not installed.")
-        return None
-
-    token_path = find_token_file()
-    client_secret_path = find_client_secret()
-
-    if not token_path.exists():
-        if "--auth" in sys.argv:
-            if not client_secret_path:
-                logger.warning("client_secret.json not found. Please add client_secret.json to credentials/ folder.")
-                return None
-            try:
-                logger.info(f"Starting one-time YouTube OAuth setup using {client_secret_path}...")
-                flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), SCOPES)
-                creds = flow.run_local_server(port=0)
-                with open(token_path, "w", encoding="utf-8") as tf:
-                    tf.write(creds.to_json())
-                logger.info("OAuth authorization successful! token.json saved.")
-                return build("youtube", "v3", credentials=creds)
-            except Exception as e:
-                logger.error(f"OAuth authorization failed: {e}")
-                return None
-        else:
-            logger.info("YouTube token.json not found. Auto-generation will save videos locally.")
-            return None
-
-    creds = None
-    try:
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-    except Exception as e:
-        logger.warning(f"Failed to load token.json: {e}")
-        return None
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                logger.info("Refreshing YouTube OAuth token...")
-                creds.refresh(Request())
-                with open(token_path, "w", encoding="utf-8") as tf:
-                    tf.write(creds.to_json())
-            except Exception as e:
-                logger.warning(f"Could not refresh token: {e}")
-                return None
-        else:
-            logger.warning("Stored token.json is invalid. Run 'python main.py --auth' to re-authenticate.")
-            return None
-
-    return build("youtube", "v3", credentials=creds)
-
-def upload_video_to_youtube(video_path: str, metadata: dict) -> dict:
-    logger.info("Checking YouTube OAuth credentials...")
-    youtube = get_authenticated_youtube_service()
-
-    if not youtube:
-        logger.warning("YouTube credentials were not found.")
-        print("\n" + "="*70)
-        print("NOTICE: YouTube credentials were not found.")
-        print("The video was generated successfully and saved locally.")
-        print("To enable auto-uploading, place client_secret.json in credentials/.")
-        print("="*70 + "\n")
-        return {"uploaded": False, "reason": "YouTube credentials not found"}
-
-    try:
-        from googleapiclient.http import MediaFileUpload
-        title = metadata.get("title", "AI Fact Video #Shorts")
-        description = metadata.get("description", "")
-        tags = metadata.get("tags", [])
-        privacy_status = YOUTUBE_PRIVACY_STATUS
-
-        body = {
-            "snippet": {
-                "title": title[:100],
-                "description": description,
-                "tags": tags,
-                "categoryId": "27"
-            },
-            "status": {
-                "privacyStatus": privacy_status,
-                "selfDeclaredMadeForKids": False
-            }
-        }
-
-        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
-        logger.info(f"Uploading '{title}' to YouTube (Privacy: {privacy_status})...")
-
-        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-        response = request.execute()
-        video_id = response.get("id")
-        video_url = f"https://youtu.be/{video_id}"
-
-        logger.info(f"UPLOAD SUCCESS! Video ID: {video_id}")
-        print("\n" + "="*50)
-        print("UPLOAD SUCCESS")
-        print("==============")
-        print(f"Title: {title}")
-        print(f"Video ID: {video_id}")
-        print(f"URL: {video_url}")
-        print("="*50 + "\n")
-
-        thumb_path = metadata.get("thumbnail_path")
-        if thumb_path and Path(thumb_path).exists():
-            try:
-                youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumb_path)).execute()
-                logger.info("Custom thumbnail uploaded successfully.")
-            except Exception as te:
-                logger.warning(f"Thumbnail upload notice: {te}")
-
-        return {"uploaded": True, "video_id": video_id, "url": video_url}
-    except Exception as e:
-        logger.error(f"[ERROR] YouTube upload failed: {e}")
-        print("\nYouTube upload failed, but your video has been safely saved locally.\n")
-        return {"uploaded": False, "reason": str(e)}
-
-
-# ==============================================================================
-# 13. MAIN PIPELINE RUNNER (SINGLE-VIDEO GENERATION PER RUN)
-# ==============================================================================
-def save_generated_video_record(record: dict):
-    records = []
-    if GENERATED_VIDEOS_FILE.exists():
         try:
-            with open(GENERATED_VIDEOS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    records = data
+
+            status = int(
+                error.resp.status
+            )
+
+            return status in {
+                408,
+                429,
+                500,
+                502,
+                503,
+                504,
+            }
+
         except Exception:
-            records = []
-    records.append(record)
-    with open(GENERATED_VIDEOS_FILE, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
 
-def run_single_video_pipeline(custom_topic: str = None):
-    print("\n" + "="*50)
-    print("AI FACT VIDEO AUTO-GENERATOR")
-    print("="*50 + "\n")
+            return False
 
-    # Step 1: Topic
-    logger.info("Selecting topic...")
-    topic_dict = generate_topic(custom_topic=custom_topic)
-    topic_text = topic_dict.get("topic")
-    logger.info(f"Topic: {topic_text}")
+    return False
 
-    # Step 2: Fact Research
-    logger.info("Researching fact...")
-    researched_fact = research_fact(topic_dict)
-    if not researched_fact.get("is_reliable", True):
-        logger.warning("Fact research failed reliability test. Regenerating topic...")
-        return run_single_video_pipeline()
 
-    # Step 3: Script Generation
-    logger.info("Generating script...")
-    script_data = generate_script(researched_fact)
-    if not check_script_safety(script_data):
-        logger.warning("Script failed safety check. Regenerating topic...")
-        return run_single_video_pipeline()
+def _upload_video_resumable(
+    youtube,
+    video_path,
+    body,
+):
 
-    # Step 4: Voiceover
-    logger.info("Generating voiceover...")
-    voiceover_info = generate_voiceover(script_data)
+    media = MediaFileUpload(
+        str(video_path),
+        chunksize=(
+            YOUTUBE_UPLOAD_CHUNK_SIZE
+        ),
+        resumable=True,
+        mimetype="video/mp4",
+    )
 
-    # Step 5: Media / Visuals
-    logger.info("Preparing scenes...")
-    media_list = prepare_scene_media(script_data, topic_text)
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+    )
 
-    # Step 6: Video Rendering
-    logger.info("Rendering video...")
-    video_path = render_video(script_data, media_list, voiceover_info, topic_dict)
+    print(
+        "📦 Upload mode: resumable "
+        "chunks of "
+        f"{YOUTUBE_UPLOAD_CHUNK_SIZE // (1024 * 1024)} MB"
+    )
 
-    # Step 7: Validation
-    logger.info("Validating video...")
-    validation = validate_video(video_path, voiceover_info.get("duration"))
-    if not validation.get("valid"):
-        logger.error(f"[ERROR] Video validation failed: {validation.get('reason')}. Generation aborted.")
-        sys.exit(1)
+    response = None
+    last_error = None
 
-    # Step 8: Metadata & Thumbnail
-    logger.info("Generating metadata and thumbnail...")
-    metadata = generate_metadata(topic_dict, researched_fact, script_data)
+    while response is None:
 
-    # Step 9: Save Local Video & Metadata
-    logger.info("Saving local video...")
-    slug = Path(video_path).stem
-    meta_json_path = METADATA_DIR / f"{slug}.json"
-    meta_payload = {
-        "topic": topic_text,
-        "category": topic_dict.get("category"),
-        "fact": researched_fact.get("main_fact"),
-        "title": metadata.get("title"),
-        "description": metadata.get("description"),
-        "tags": metadata.get("tags"),
-        "hashtags": metadata.get("hashtags"),
-        "duration": voiceover_info.get("duration"),
-        "video_path": str(video_path),
-        "thumbnail_path": metadata.get("thumbnail_path"),
-        "created_at": datetime.datetime.now().isoformat(),
-        "youtube_uploaded": False,
-        "youtube_video_id": None
+        try:
+
+            status, response = (
+                request.next_chunk()
+            )
+
+            if status is not None:
+
+                try:
+
+                    progress = int(
+                        status.progress()
+                        * 100
+                    )
+
+                    print(
+                        "📤 YouTube upload "
+                        f"progress: {progress}%",
+                        flush=True,
+                    )
+
+                except Exception:
+                    pass
+
+            if response is not None:
+                break
+
+        except Exception as error:
+
+            last_error = error
+
+            if not _is_retryable_youtube_error(
+                error
+            ):
+                raise
+
+            print(
+                "⚠️ Temporary YouTube "
+                "upload/network error:"
+            )
+
+            print(
+                error
+            )
+
+            recovered = False
+
+            for retry in range(
+                1,
+                YOUTUBE_UPLOAD_MAX_RETRIES + 1,
+            ):
+
+                delay = min(
+                    60,
+                    2 ** retry,
+                )
+
+                print(
+                    f"🔄 Upload retry "
+                    f"{retry}/"
+                    f"{YOUTUBE_UPLOAD_MAX_RETRIES} "
+                    f"in {delay}s..."
+                )
+
+                time.sleep(
+                    delay
+                )
+
+                try:
+
+                    status, response = (
+                        request.next_chunk()
+                    )
+
+                    if status is not None:
+
+                        try:
+
+                            progress = int(
+                                status.progress()
+                                * 100
+                            )
+
+                            print(
+                                "📤 YouTube upload "
+                                f"progress: {progress}%",
+                                flush=True,
+                            )
+
+                        except Exception:
+                            pass
+
+                    recovered = True
+                    break
+
+                except Exception as retry_error:
+
+                    last_error = (
+                        retry_error
+                    )
+
+                    print(
+                        f"⚠️ Retry {retry} failed:",
+                        retry_error,
+                    )
+
+                    if not _is_retryable_youtube_error(
+                        retry_error
+                    ):
+                        raise
+
+            if not recovered:
+
+                raise RuntimeError(
+                    "YouTube resumable upload "
+                    "failed after "
+                    f"{YOUTUBE_UPLOAD_MAX_RETRIES} "
+                    f"retries. Last error: "
+                    f"{last_error}"
+                ) from last_error
+
+    if (
+        not response
+        or not response.get("id")
+    ):
+
+        raise RuntimeError(
+            "YouTube upload finished "
+            "without a video ID."
+        )
+
+    return response["id"]
+
+
+def _upload_thumbnail_with_retry(
+    youtube,
+    video_id,
+    thumbnail_path,
+):
+
+    if (
+        not thumbnail_path
+        or not os.path.exists(
+            thumbnail_path
+        )
+    ):
+
+        return
+
+    print(
+        "🖼️ Uploading custom thumbnail..."
+    )
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        4,
+    ):
+
+        try:
+
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(
+                    str(thumbnail_path),
+                    mimetype="image/jpeg",
+                ),
+            ).execute()
+
+            print(
+                "✅ Thumbnail uploaded."
+            )
+
+            return
+
+        except Exception as error:
+
+            last_error = error
+
+            print(
+                f"⚠️ Thumbnail attempt "
+                f"{attempt}/3 failed:",
+                error,
+            )
+
+            if (
+                attempt < 3
+                and _is_retryable_youtube_error(
+                    error
+                )
+            ):
+
+                time.sleep(
+                    2 * attempt
+                )
+
+            else:
+
+                break
+
+    print(
+        "⚠️ Thumbnail upload failed "
+        "after retries:",
+        last_error,
+    )
+
+
+# ============================================================
+# YOUTUBE UPLOAD WITH SEO
+# ============================================================
+
+def upload_to_youtube(
+    video_path,
+    title,
+    description,
+    thumbnail_path=None,
+    seo=None,
+):
+
+    # --------------------------------------------------------
+    # ABSOLUTE SAFETY:
+    # Validate video one more time immediately before upload.
+    # --------------------------------------------------------
+
+    validate_completed_video(
+        video_path,
+        expected_scene_count=7,
+    )
+
+    print(
+        "\n📤 UPLOADING TO YOUTUBE..."
+    )
+
+    youtube = get_youtube_service()
+
+    seo = (
+        seo
+        if isinstance(
+            seo,
+            dict,
+        )
+        else {}
+    )
+
+    final_title = str(
+        seo.get(
+            "title",
+            title
+            or "Indian Mystery Short #Shorts",
+        )
+    ).strip()
+
+    final_description = str(
+        seo.get(
+            "description",
+            description
+            or "",
+        )
+    ).strip()
+
+    tags = seo.get(
+        "tags",
+        [],
+    )
+
+    if not isinstance(
+        tags,
+        list,
+    ):
+        tags = []
+
+    tags = [
+        str(tag).strip()
+        for tag in tags
+        if str(tag).strip()
+    ]
+
+    core_tags = [
+        "Shorts",
+        "Indian Mystery",
+        "Indian History",
+        "India Facts",
+        "Hindi Facts",
+        "Hindi Mystery",
+    ]
+
+    for tag in core_tags:
+
+        if tag.lower() not in {
+            x.lower()
+            for x in tags
+        }:
+
+            tags.append(
+                tag
+            )
+
+    tags = tags[:30]
+
+    final_title = final_title[:100]
+
+    body = {
+        "snippet": {
+            "title": final_title,
+            "description": final_description,
+            "tags": tags,
+            "categoryId": "27",
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
     }
-    with open(meta_json_path, "w", encoding="utf-8") as f:
-        json.dump(meta_payload, f, indent=2, ensure_ascii=False)
 
-    logger.info(f"Local metadata saved to: {meta_json_path}")
+    print(
+        "\n📌 UPLOAD SEO"
+    )
 
-    save_used_topic({
-        "topic": topic_text,
-        "category": topic_dict.get("category"),
-        "date": datetime.datetime.now().isoformat(),
-        "video_filename": Path(video_path).name
-    })
+    print(
+        "TITLE:",
+        final_title,
+    )
 
-    # Step 10: Check YouTube Credentials & Upload
-    logger.info("Checking YouTube credentials...")
-    upload_result = upload_video_to_youtube(video_path, metadata)
+    print(
+        "TAGS:",
+        ", ".join(tags),
+    )
 
-    if upload_result.get("uploaded"):
-        meta_payload["youtube_uploaded"] = True
-        meta_payload["youtube_video_id"] = upload_result.get("video_id")
-        with open(meta_json_path, "w", encoding="utf-8") as f:
-            json.dump(meta_payload, f, indent=2, ensure_ascii=False)
+    print(
+        "DESCRIPTION:"
+    )
 
-    save_generated_video_record(meta_payload)
+    print(
+        final_description
+    )
 
-    print("\n" + "="*50)
-    print("SUCCESSFUL GENERATION SUMMARY")
-    print("="*50)
-    print(f"Topic: {topic_text}")
-    print(f"Video Saved Locally: {video_path}")
-    print(f"Metadata Saved: {meta_json_path}")
-    if upload_result.get("uploaded"):
-        print(f"YouTube URL: {upload_result.get('url')}")
+    file_size_mb = (
+        os.path.getsize(
+            video_path
+        )
+        / (
+            1024 * 1024
+        )
+        if os.path.exists(
+            video_path
+        )
+        else 0
+    )
+
+    print(
+        f"🎬 Video size: "
+        f"{file_size_mb:.2f} MB"
+    )
+
+    video_id = (
+        _upload_video_resumable(
+            youtube,
+            video_path,
+            body,
+        )
+    )
+
+    print(
+        "\n🎉 YOUTUBE UPLOAD SUCCESS"
+    )
+
+    print(
+        "🆔 Video ID:",
+        video_id,
+    )
+
+    print(
+        "🔗 https://www.youtube.com/watch?v="
+        + video_id
+    )
+
+    _upload_thumbnail_with_retry(
+        youtube,
+        video_id,
+        thumbnail_path,
+    )
+
+    return video_id
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+def cleanup_old_scene_files():
+
+    print(
+        "\n🧹 Cleaning old temporary files..."
+    )
+
+    for folder in (
+        CLIPS_DIR,
+        AUDIO_DIR,
+    ):
+
+        if not folder.exists():
+            continue
+
+        for item in folder.iterdir():
+
+            try:
+
+                if item.is_file():
+                    item.unlink()
+
+            except Exception:
+                pass
+
+    # Remove previous incomplete final video.
+    old_video = (
+        OUTPUT_DIR
+        / "mystery_short.mp4"
+    )
+
+    try:
+
+        if old_video.exists():
+            old_video.unlink()
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# RETRY ENTIRE VIDEO GENERATION
+# ============================================================
+
+def generate_complete_video_with_retry():
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        MAX_FULL_VIDEO_ATTEMPTS + 1,
+    ):
+
+        print(
+            "\n"
+            + "=" * 75
+        )
+
+        print(
+            f"🔄 COMPLETE VIDEO GENERATION "
+            f"ATTEMPT {attempt}/"
+            f"{MAX_FULL_VIDEO_ATTEMPTS}"
+        )
+
+        print(
+            "=" * 75
+        )
+
+        # ----------------------------------------------------
+        # Each full attempt gets a completely fresh topic.
+        # ----------------------------------------------------
+
+        try:
+
+            cleanup_old_scene_files()
+
+            story = generate_mystery_story()
+
+            print(
+                "\n📜 GENERATED STORY:"
+            )
+
+            print(
+                json.dumps(
+                    story,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+
+            video_path = assemble_video(
+                story
+            )
+
+            # ------------------------------------------------
+            # Final validation.
+            # ------------------------------------------------
+
+            validate_completed_video(
+                video_path,
+                expected_scene_count=7,
+            )
+
+            print(
+                "\n"
+                + "=" * 75
+            )
+
+            print(
+                "🎉 COMPLETE VIDEO GENERATION SUCCESS"
+            )
+
+            print(
+                "=" * 75
+            )
+
+            return (
+                story,
+                video_path,
+            )
+
+        except Exception as e:
+
+            last_error = e
+
+            print(
+                "\n"
+                + "=" * 75
+            )
+
+            print(
+                f"⚠️ COMPLETE VIDEO ATTEMPT "
+                f"{attempt} FAILED"
+            )
+
+            print(
+                "=" * 75
+            )
+
+            print(
+                "Reason:",
+                e,
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Do NOT mark topic as used here.
+            #
+            # Because video did not successfully complete.
+            # ------------------------------------------------
+
+            cleanup_old_scene_files()
+
+            if attempt < MAX_FULL_VIDEO_ATTEMPTS:
+
+                delay = min(
+                    30,
+                    5 * attempt,
+                )
+
+                print(
+                    f"\n🔁 Starting complete "
+                    f"video generation again "
+                    f"in {delay} seconds..."
+                )
+
+                time.sleep(
+                    delay
+                )
+
+    raise RuntimeError(
+        "\n❌ COMPLETE VIDEO GENERATION FAILED.\n"
+        f"All {MAX_FULL_VIDEO_ATTEMPTS} attempts failed.\n"
+        f"Last error: {last_error}"
+    ) from last_error
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print(
+        "\n"
+    )
+
+    print(
+        "=" * 75
+    )
+
+    print(
+        "🇮🇳 INDIA-ONLY DARK HISTORY & MYSTERY SHORTS AUTOBOT"
+    )
+
+    print(
+        "=" * 75
+    )
+
+    print(
+        "🎙️ Male Hindi Voice:",
+        VOICE,
+    )
+
+    print(
+        "⚡ Voice Speed:",
+        VOICE_RATE,
+    )
+
+    print(
+        "🔥 Hook:",
+        "EXTREMELY STRONG / 0-3 SEC",
+    )
+
+    print(
+        "🎬 Format:",
+        "1080x1920",
+    )
+
+    print(
+        "📱 Shorts:",
+        "9:16",
+    )
+
+    print(
+        "✂️ Rapid Cuts:",
+        "Enabled",
+    )
+
+    print(
+        "💥 Story-Based SFX:",
+        "Enabled",
+    )
+
+    print(
+        "🔊 SFX Volume:",
+        f"{SFX_BASE_VOLUME:.2f}",
+    )
+
+    print(
+        "🎵 BGM Volume:",
+        f"{BGM_VOLUME:.2f}",
+    )
+
+    print(
+        "📝 Captions:",
+        "DISABLED / REMOVED",
+    )
+
+    print(
+        "🖼️ Thumbnail:",
+        "Enabled",
+    )
+
+    print(
+        "🔍 SEO:",
+        "Title + Description + Tags + Hashtags",
+    )
+
+    print(
+        "♻️ Duplicate Topics:",
+        "BLOCKED",
+    )
+
+    print(
+        "📚 Topic History:",
+        USED_TOPICS_FILE,
+    )
+
+    print(
+        "▶️ YouTube Upload:",
+        "ONLY AFTER COMPLETE VIDEO VALIDATION",
+    )
+
+    print(
+        "🎥 Scene Completion:",
+        "7/7 REQUIRED",
+    )
+
+    print(
+        "🔁 Full Video Retry:",
+        f"{MAX_FULL_VIDEO_ATTEMPTS} attempts",
+    )
+
+    print(
+        "🔎 Pexels Fallbacks:",
+        f"{MAX_PEXELS_QUERY_ATTEMPTS} queries/scene",
+    )
+
+    print(
+        "🇮🇳 Niche:",
+        "INDIA ONLY — Indian Facts / History / Mysteries",
+    )
+
+    print(
+        "=" * 75
+    )
+
+    # --------------------------------------------------------
+    # Show available SFX.
+    # --------------------------------------------------------
+
+    available_sfx = get_available_sfx()
+
+    print(
+        "\n🎧 AVAILABLE SFX:"
+    )
+
+    if available_sfx:
+
+        for item in available_sfx:
+
+            print(
+                f"   ✅ {item}.mp3"
+            )
+
     else:
-        print("YouTube Upload: Saved locally (YouTube OAuth credentials not configured).")
-    print("="*50 + "\n")
+
+        print(
+            "   ❌ No SFX files found!"
+        )
+
+        print(
+            "   Put these files inside:"
+        )
+
+        print(
+            "   sfx/whoosh.mp3"
+        )
+
+        print(
+            "   sfx/impact.mp3"
+        )
+
+        print(
+            "   sfx/heartbeat.mp3"
+        )
+
+        print(
+            "   sfx/hit.mp3"
+        )
+
+    # --------------------------------------------------------
+    # Complete video generation.
+    #
+    # This function will NOT return until a complete 7/7
+    # video has been successfully generated.
+    # --------------------------------------------------------
+
+    story, video_path = (
+        generate_complete_video_with_retry()
+    )
+
+    # --------------------------------------------------------
+    # Thumbnail ONLY AFTER complete video.
+    # --------------------------------------------------------
+
+    thumbnail = create_thumbnail(
+        video_path,
+        story.get(
+            "title",
+            "Mystery",
+        ),
+    )
+
+    # --------------------------------------------------------
+    # Verify video again before YouTube.
+    # --------------------------------------------------------
+
+    validate_completed_video(
+        video_path,
+        expected_scene_count=7,
+    )
+
+    # --------------------------------------------------------
+    # YouTube upload.
+    #
+    # If upload fails, topic is STILL marked as used because
+    # the complete video was successfully created.
+    # --------------------------------------------------------
+
+    upload_success = False
+
+    try:
+
+        upload_to_youtube(
+            video_path,
+            story.get(
+                "title",
+                "Mystery Short #Shorts",
+            ),
+            story.get(
+                "description",
+                "",
+            ),
+            thumbnail,
+            story.get(
+                "seo",
+                {},
+            ),
+        )
+
+        upload_success = True
+
+    except Exception as e:
+
+        print(
+            "\n⚠️ YouTube upload "
+            "skipped/failed:"
+        )
+
+        print(
+            e
+        )
+
+    # --------------------------------------------------------
+    # IMPORTANT TOPIC HISTORY RULE
+    #
+    # The topic is saved only because the complete video was
+    # successfully generated and validated.
+    #
+    # If video generation failed, this code never reaches here.
+    # --------------------------------------------------------
+
+    if os.path.exists(
+        video_path
+    ):
+
+        mark_topic_used(
+            story["topic"]
+        )
+
+        print(
+            "♻️ Duplicate topic protection: "
+            "ACTIVE"
+        )
+
+    print(
+        "\n"
+        + "=" * 75
+    )
+
+    print(
+        "🎉 COMPLETE"
+    )
+
+    print(
+        "=" * 75
+    )
+
+    print(
+        "🎬 Video:",
+        os.path.abspath(
+            video_path
+        ),
+    )
+
+    print(
+        "🖼️ Thumbnail:",
+        os.path.abspath(
+            thumbnail
+        ),
+    )
+
+    print(
+        "📚 Used topics file:",
+        os.path.abspath(
+            USED_TOPICS_FILE
+        ),
+    )
+
+    print(
+        "📌 Current topic:",
+        story["topic"],
+    )
+
+    print(
+        "🎥 Scenes:",
+        "7/7 COMPLETE",
+    )
+
+    print(
+        "🔒 Topic saved:",
+        "YES",
+    )
+
+    print(
+        "▶️ YouTube upload:",
+        "SUCCESS"
+        if upload_success
+        else "FAILED / SKIPPED",
+    )
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
-    if "--auth" in sys.argv:
-        print("Authenticating with YouTube Data API...")
-        svc = get_authenticated_youtube_service()
-        if svc:
-            print("YouTube authentication successful! token.json has been created in credentials/ folder.")
-        else:
-            print("Authentication failed or cancelled.")
-        sys.exit(0)
 
-    custom_topic = None
-    if len(sys.argv) > 1:
-        raw_args = sys.argv[1:]
-        if raw_args[0] == "--topic":
-            raw_args = raw_args[1:]
-        if raw_args:
-            custom_topic = " ".join(raw_args).strip()
-    run_single_video_pipeline(custom_topic=custom_topic)
+    try:
+
+        main()
+
+    except Exception as e:
+
+        print(
+            "\n"
+            + "=" * 75
+        )
+
+        print(
+            "❌ FATAL ERROR"
+        )
+
+        print(
+            "=" * 75
+        )
+
+        print(
+            e
+        )
+
+        raise
