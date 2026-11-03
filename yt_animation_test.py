@@ -2105,6 +2105,58 @@ async def create_voice(
     return False
 
 
+def generate_elevenlabs_voice(text, output_file):
+    """Generate speech through ElevenLabs; return False to allow the built-in TTS fallback."""
+    if not ELEVENLABS_KEY:
+        return False
+
+    try:
+        url = (
+            "https://api.elevenlabs.io/v1/text-to-speech/"
+            f"{ELEVENLABS_VOICE_ID}"
+        )
+        response = requests.post(
+            url,
+            headers={
+                "xi-api-key": ELEVENLABS_KEY,
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": str(text),
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {
+                    "stability": 0.45,
+                    "similarity_boost": 0.75,
+                    "style": 0.2,
+                    "use_speaker_boost": True,
+                },
+            },
+            params={"output_format": "mp3_44100_128"},
+            timeout=(20, 120),
+        )
+        if response.status_code != 200:
+            print(
+                "⚠️ ElevenLabs voice failed "
+                f"({response.status_code}): {response.text[:300]}"
+            )
+            return False
+
+        if not response.content or len(response.content) < 1000:
+            print("⚠️ ElevenLabs returned an empty/too-small audio file.")
+            return False
+
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(response.content)
+        print("✅ ElevenLabs Hindi voice generated.")
+        return True
+
+    except Exception as err:
+        print(f"⚠️ ElevenLabs voice error; using fallback TTS: {err}")
+        return False
+
+
 def generate_voice(
     text,
     scene_number,
